@@ -70,7 +70,13 @@ namespace MEAI.FileClassificationWatcher
                 };
                 watcher.Created += (_, e) => Task.Run(() => OnCreated(e.FullPath));
                 watcher.Changed += (_, e) => OnChanged(e.FullPath);
-                watcher.Renamed += (_, e) => OnChanged(e.FullPath);
+                watcher.Renamed += (_, e) =>
+                {
+                    if (_pendingCloseWatches.TryRemove(e.OldFullPath, out var staleCts))
+                        staleCts.Cancel();
+                    OnChanged(e.FullPath);
+                }
+                ;
                 _watchers.Add(watcher);
             }
         }

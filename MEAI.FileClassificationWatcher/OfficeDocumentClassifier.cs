@@ -37,9 +37,20 @@ namespace MEAI.FileClassificationWatcher
             var ext = Path.GetExtension(path).ToLowerInvariant();
             return ext is ".docx" or ".doc" or ".xlsx" or ".xls" or ".pptx" or ".ppt";
         }
-
+        private static void ClearReadOnlyAttribute(string path)
+        {
+            try
+            {
+                var attrs = File.GetAttributes(path);
+                if (attrs.HasFlag(FileAttributes.ReadOnly))
+                    File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
+            }
+            catch { /* best effort */ }
+        }
         private static bool ApplyToWord(string path, ClassificationLevel level, string? passwordAction, string? openPassword = null)
         {
+            if (!File.Exists(path)) return false; // renamed/deleted since the close was detected
+            ClearReadOnlyAttribute(path);
             Microsoft.Office.Interop.Word.Application? app = null;
             Microsoft.Office.Interop.Word.Document? doc = null;
             try
@@ -74,6 +85,8 @@ namespace MEAI.FileClassificationWatcher
 
         private static bool ApplyToExcel(string path, ClassificationLevel level, string? passwordAction, string? openPassword = null)
         {
+            if (!File.Exists(path)) return false; // renamed/deleted since the close was detected
+            ClearReadOnlyAttribute(path);
             Microsoft.Office.Interop.Excel.Application? app = null;
             Microsoft.Office.Interop.Excel.Workbook? wb = null;
             try
@@ -104,6 +117,8 @@ namespace MEAI.FileClassificationWatcher
 
         private static bool ApplyToPowerPoint(string path, ClassificationLevel level, string? passwordAction)
         {
+            if (!File.Exists(path)) return false; // renamed/deleted since the close was detected
+            ClearReadOnlyAttribute(path);
             Microsoft.Office.Interop.PowerPoint.Application? app = null;
             Microsoft.Office.Interop.PowerPoint.Presentation? pres = null;
             try
@@ -154,32 +169,32 @@ namespace MEAI.FileClassificationWatcher
         }
 
         private static void WriteCategory(object builtInPropsObj, ClassificationLevel level)
-{
-    try
-    {
-        dynamic props = builtInPropsObj;
-        props["Category"].Value = level.ToDisplayName();
-    }
-    catch (Exception ex)
-    {
-        Logger.LogError("WriteCategory failed to set Category property", ex);
-    }
-}
+        {
+            try
+            {
+                dynamic props = builtInPropsObj;
+                props["Category"].Value = level.ToDisplayName();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("WriteCategory failed to set Category property", ex);
+            }
+        }
 
-private static void WriteCustomProperty(object customPropsObj, string value)
-{
-    const string propName = "MEAI_Classification";
-    try
-    {
-        dynamic props = customPropsObj;
-        try { props[propName].Delete(); } catch { /* didn't exist yet */ }
-        props.Add(propName, false, Microsoft.Office.Core.MsoDocProperties.msoPropertyTypeString, value);
-    }
-    catch (Exception ex)
-    {
-        Logger.LogError("WriteCustomProperty failed to set MEAI_Classification property", ex);
-    }
-}
+        private static void WriteCustomProperty(object customPropsObj, string value)
+        {
+            const string propName = "MEAI_Classification";
+            try
+            {
+                dynamic props = customPropsObj;
+                try { props[propName].Delete(); } catch { /* didn't exist yet */ }
+                props.Add(propName, false, Microsoft.Office.Core.MsoDocProperties.msoPropertyTypeString, value);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("WriteCustomProperty failed to set MEAI_Classification property", ex);
+            }
+        }
 
         private static T? OpenWithRetry<T>(Func<T> openAction) where T : class
         {
