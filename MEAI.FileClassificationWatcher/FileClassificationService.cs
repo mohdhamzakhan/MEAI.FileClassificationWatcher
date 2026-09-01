@@ -35,7 +35,9 @@ namespace MEAI.FileClassificationWatcher
         private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingCloseWatches = new();
         private readonly ConcurrentDictionary<string, DateTime> _selfAppliedUtc =
             new(StringComparer.OrdinalIgnoreCase);
-        private static readonly TimeSpan SelfWriteSuppressWindow = TimeSpan.FromSeconds(8);
+        private static readonly TimeSpan SelfWriteSuppressWindow = TimeSpan.FromSeconds(38);
+        private readonly ConcurrentDictionary<string, byte> _inFlight =
+                        new(StringComparer.OrdinalIgnoreCase);
         public FileClassificationService(WatcherConfig config)
         {
             _config = config;
@@ -86,6 +88,11 @@ namespace MEAI.FileClassificationWatcher
             if (ClassificationSidecar.IsSidecarFile(path)) return true;
             if (name.StartsWith("~$") || name.StartsWith(".~")) return true; // Office/editor temp locks
             if (Directory.Exists(path)) return true; // it's a folder, not a file
+
+            // NEW — a classification is already in progress for this exact file;
+            // any event that arrives while we're mid-Apply() is noise from our own
+            // open/write/save cycle, not a genuine new user edit.
+            if (_inFlight.ContainsKey(path)) return true;
 
             // NEW: ignore the echo Changed event caused by our own headless
             // COM save in OfficeDocumentClassifier.Apply — otherwise the tool
@@ -234,6 +241,8 @@ namespace MEAI.FileClassificationWatcher
         // (for Office formats) and OnChanged (everything).
         private void QueueCloseWatch(string path)
         {
+            if (_inFlight.ContainsKey(path)) return; // already mid-classification; nothing to (re)queue
+
             if (_pendingCloseWatches.TryRemove(path, out var oldCts))
                 oldCts.Cancel();
 
@@ -412,32 +421,41 @@ namespace MEAI.FileClassificationWatcher
                 PasswordStore.Delete(documentGuid);
             }
 
-            var applied = OfficeDocumentClassifier.Apply(path, newLevel, passwordAction, knownPassword);
-            _selfAppliedUtc[path] = File.GetLastWriteTimeUtc(path);   // NEW — stops the echo before it can queue another watch
-            if (!applied)
-            {
-                Logger.LogError($"HandleOfficeFileClosedAsync: failed to apply classification to '{path}'",
-                    new Exception("OfficeDocumentClassifier.Apply returned false — see prior log entry for the underlying exception."));
-                // Still log the intended classification below so there's an audit trail
-                // even though the in-file property/password write failed.
-            }
+            if (!_inFlight.TryAdd(path, 0))
+                return; // another cycle for this exact path is already running — let it finish
 
-            await _api.LogAsync(new ClassificationLogEntry
+            try
             {
-                Application = Path.GetExtension(path).ToLowerInvariant() switch
+                _selfAppliedUtc[path] = DateTime.UtcNow; // mark BEFORE Apply's save can fire its echo
+                var applied = OfficeDocumentClassifier.Apply(path, newLevel, passwordAction, knownPassword);
+
+                if (!applied)
                 {
-                    ".docx" or ".doc" => "Word",
-                    ".xlsx" or ".xls" => "Excel",
-                    ".pptx" or ".ppt" => "PowerPoint",
-                    _ => "File"
-                },
-                DocumentName = Path.GetFileName(path),
-                DocumentPath = path,
-                DocumentGuid = documentGuid,
-                ActionType = isNew ? "Created" : (levelChanged ? "ChangedOnClose" : "ConfirmedOnClose"),
-                PreviousClassification = currentFromApi,
-                Classification = newLevel.ToString()
-            });
+                    Logger.LogError($"HandleOfficeFileClosedAsync: failed to apply classification to '{path}'",
+                        new Exception("OfficeDocumentClassifier.Apply returned false — see prior log entry for the underlying exception."));
+                }
+
+                await _api.LogAsync(new ClassificationLogEntry
+                {
+                    Application = Path.GetExtension(path).ToLowerInvariant() switch
+                    {
+                        ".docx" or ".doc" => "Word",
+                        ".xlsx" or ".xls" => "Excel",
+                        ".pptx" or ".ppt" => "PowerPoint",
+                        _ => "File"
+                    },
+                    DocumentName = Path.GetFileName(path),
+                    DocumentPath = path,
+                    DocumentGuid = documentGuid,
+                    ActionType = isNew ? "Created" : (levelChanged ? "ChangedOnClose" : "ConfirmedOnClose"),
+                    PreviousClassification = currentFromApi,
+                    Classification = newLevel.ToString()
+                });
+            }
+            finally
+            {
+                _inFlight.TryRemove(path, out _);
+            }
         }
 
         // Returns the password to set (non-empty string), or null if the user cancelled
