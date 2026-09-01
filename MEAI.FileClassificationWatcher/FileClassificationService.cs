@@ -72,11 +72,16 @@ namespace MEAI.FileClassificationWatcher
                 watcher.Changed += (_, e) => OnChanged(e.FullPath);
                 watcher.Renamed += (_, e) =>
                 {
+                    // Cancel any in-flight watch for the OLD path — it's about to point at a
+                    // file that no longer exists (classic Explorer "New file" flow: create,
+                    // then immediately rename while still in the inline-edit box). Without
+                    // this, the stale watch runs to completion and OfficeDocumentClassifier
+                    // fails with "couldn't find <old name>" once the popup/Apply cycle
+                    // catches up to a file that's already been renamed away.
                     if (_pendingCloseWatches.TryRemove(e.OldFullPath, out var staleCts))
                         staleCts.Cancel();
                     OnChanged(e.FullPath);
-                }
-                ;
+                };
                 _watchers.Add(watcher);
             }
         }
@@ -193,6 +198,18 @@ namespace MEAI.FileClassificationWatcher
 
                 if (OfficeDocumentClassifier.IsOfficeFormat(path))
                 {
+                    // Give Explorer's inline rename box time to finish before treating this
+                    // file as "released". A fresh Explorer "New > Office Document" leaves
+                    // the filename in an editable state for the user to type a real name,
+                    // and since nobody has the file locked yet, the release-check below
+                    // would otherwise fire almost instantly and pop the classification
+                    // prompt against the placeholder name (e.g. "New Word Document.docx")
+                    // before the rename ever lands on disk.
+                    await Task.Delay(TimeSpan.FromSeconds(4));
+                    if (!File.Exists(path)) return; // renamed away during the settle window
+                                                    // — the Renamed handler already queued
+                                                    // a fresh watch for the new name
+
                     // Office files can't be touched via COM automation while the app that
                     // just created them still has the file open — a brand-new .docx is
                     // open in the user's own Word window the instant it exists. Route
@@ -374,6 +391,10 @@ namespace MEAI.FileClassificationWatcher
         // this watcher can safely open the file itself.
         private async Task HandleOfficeFileClosedAsync(string path)
         {
+            if (!File.Exists(path)) return; // renamed/deleted since release was detected —
+                                            // the correct cycle for its new name (if any)
+                                            // is already queued separately
+
             var documentGuid = ClassificationSidecar.DeterministicDocumentGuid(path);
             var currentFromApi = await _api.GetLatestClassificationAsync(documentGuid);
             var currentLevel = ClassificationLevelExtensions.Parse(currentFromApi);

@@ -37,24 +37,16 @@ namespace MEAI.FileClassificationWatcher
             var ext = Path.GetExtension(path).ToLowerInvariant();
             return ext is ".docx" or ".doc" or ".xlsx" or ".xls" or ".pptx" or ".ppt";
         }
-        private static void ClearReadOnlyAttribute(string path)
-        {
-            try
-            {
-                var attrs = File.GetAttributes(path);
-                if (attrs.HasFlag(FileAttributes.ReadOnly))
-                    File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
-            }
-            catch { /* best effort */ }
-        }
+
         private static bool ApplyToWord(string path, ClassificationLevel level, string? passwordAction, string? openPassword = null)
         {
-            if (!File.Exists(path)) return false; // renamed/deleted since the close was detected
-            ClearReadOnlyAttribute(path);
             Microsoft.Office.Interop.Word.Application? app = null;
             Microsoft.Office.Interop.Word.Document? doc = null;
             try
             {
+                if (!File.Exists(path)) return false; // renamed/deleted since the close was detected
+                ClearReadOnlyAttribute(path);
+
                 app = new Microsoft.Office.Interop.Word.Application
                 {
                     Visible = false,
@@ -69,7 +61,7 @@ namespace MEAI.FileClassificationWatcher
                 WriteCategory(doc.BuiltInDocumentProperties, level);
                 ApplyPassword(passwordAction, v => doc.Password = v);
 
-                doc.Save();
+                SaveWithRetry(path, doc.Save, () => doc.ProtectionType.ToString());
                 return true;
             }
             catch (Exception ex)
@@ -85,12 +77,13 @@ namespace MEAI.FileClassificationWatcher
 
         private static bool ApplyToExcel(string path, ClassificationLevel level, string? passwordAction, string? openPassword = null)
         {
-            if (!File.Exists(path)) return false; // renamed/deleted since the close was detected
-            ClearReadOnlyAttribute(path);
             Microsoft.Office.Interop.Excel.Application? app = null;
             Microsoft.Office.Interop.Excel.Workbook? wb = null;
             try
             {
+                if (!File.Exists(path)) return false; // renamed/deleted since the close was detected
+                ClearReadOnlyAttribute(path);
+
                 app = new Microsoft.Office.Interop.Excel.Application { Visible = false, DisplayAlerts = false, AutomationSecurity = Microsoft.Office.Core.MsoAutomationSecurity.msoAutomationSecurityLow };
                 wb = OpenWithRetry(() => app.Workbooks.Open(path, ReadOnly: false, UpdateLinks: false,
                                     Password: openPassword ?? ""));
@@ -101,7 +94,7 @@ namespace MEAI.FileClassificationWatcher
                 WriteCategory(excelWb.BuiltInDocumentProperties, level);
                 ApplyPassword(passwordAction, () => wb.Password, v => wb.Password = v);
 
-                wb.Save();
+                SaveWithRetry(path, wb.Save, () => "n/a");
                 return true;
             }
             catch (Exception ex)
@@ -117,12 +110,13 @@ namespace MEAI.FileClassificationWatcher
 
         private static bool ApplyToPowerPoint(string path, ClassificationLevel level, string? passwordAction)
         {
-            if (!File.Exists(path)) return false; // renamed/deleted since the close was detected
-            ClearReadOnlyAttribute(path);
             Microsoft.Office.Interop.PowerPoint.Application? app = null;
             Microsoft.Office.Interop.PowerPoint.Presentation? pres = null;
             try
             {
+                if (!File.Exists(path)) return false; // renamed/deleted since the close was detected
+                ClearReadOnlyAttribute(path);
+
                 // PowerPoint's Application object doesn't reliably support a headless
                 // Visible=false the way Word/Excel do — some PowerPoint versions ignore it,
                 // treat it as read-only, or briefly flash a window regardless. Opening with
@@ -138,7 +132,7 @@ namespace MEAI.FileClassificationWatcher
                 WriteCategory(pres.BuiltInDocumentProperties, level);
                 ApplyPassword(passwordAction, () => pres.Password, v => pres.Password = v);
 
-                pres.Save();
+                SaveWithRetry(path, pres.Save, () => "n/a");
                 return true;
             }
             catch (Exception ex)
@@ -193,6 +187,67 @@ namespace MEAI.FileClassificationWatcher
             catch (Exception ex)
             {
                 Logger.LogError("WriteCustomProperty failed to set MEAI_Classification property", ex);
+            }
+        }
+
+        // Files created via Explorer's "New > Word/Excel/PowerPoint Document" menu sometimes
+        // inherit the NTFS Read-only attribute from the ShellNew template Explorer copies
+        // from. Word/Excel/PowerPoint's own ReadOnly:false open parameter only controls the
+        // app's internal editing lock — it does NOT clear this OS-level attribute — so the
+        // file opens fine but .Save() throws (0x800A11FD for Word) unless we clear it first.
+        private static void ClearReadOnlyAttribute(string path)
+        {
+            try
+            {
+                var attrs = File.GetAttributes(path);
+                if (attrs.HasFlag(FileAttributes.ReadOnly))
+                    File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
+            }
+            catch
+            {
+                // best effort — if we can't read/clear it, the Open/Save call below will
+                // surface a clearer error than swallowing this silently would.
+            }
+        }
+
+        // A single clear-then-open wasn't enough to fix the "document is read-only" save
+        // failure on brand-new files under Desktop — the leading theory is a corporate
+        // OneDrive-redirected Desktop briefly re-asserting the Read-only attribute on a
+        // just-created file while it registers it for sync, which can happen AFTER our one-
+        // time ClearReadOnlyAttribute() call but BEFORE Save() actually runs. So: retry the
+        // save itself, re-clearing the attribute on every attempt, and if it still fails
+        // after all retries, log enough state (file attribute + doc protection, where
+        // available) to tell definitively whether this is really an attribute race or
+        // something else (e.g. Restrict Editing / Protected View) — the prior log entries
+        // only ever showed the COM exception, not the underlying file/doc state.
+        private const int MaxSaveRetries = 5;
+        private static readonly TimeSpan SaveRetryDelay = TimeSpan.FromMilliseconds(750);
+
+        private static void SaveWithRetry(string path, Action save, Func<string> describeProtection)
+        {
+            for (int attempt = 1; attempt <= MaxSaveRetries; attempt++)
+            {
+                ClearReadOnlyAttribute(path);
+                try
+                {
+                    save();
+                    return;
+                }
+                catch (COMException) when (attempt < MaxSaveRetries)
+                {
+                    System.Threading.Thread.Sleep(SaveRetryDelay);
+                }
+                catch (COMException)
+                {
+                    string attrs = "unknown", protection = "unknown";
+                    try { attrs = File.GetAttributes(path).ToString(); } catch { }
+                    try { protection = describeProtection(); } catch { }
+                    Logger.LogError(
+                        $"SaveWithRetry: still read-only after {MaxSaveRetries} attempts for '{path}'. " +
+                        $"FileAttributes='{attrs}', DocProtectionType='{protection}'",
+                        new Exception("See FileAttributes/DocProtectionType above for root cause."));
+                    throw;
+                }
             }
         }
 
