@@ -26,6 +26,7 @@ namespace MEAI.FileClassificationWatcher
             StartPosition = FormStartPosition.CenterScreen;
             MinimizeBox = false;
             MaximizeBox = false;
+            ControlBox = allowCancel;
             TopMost = true;
             AutoSize = true;
             AutoSizeMode = AutoSizeMode.GrowAndShrink;

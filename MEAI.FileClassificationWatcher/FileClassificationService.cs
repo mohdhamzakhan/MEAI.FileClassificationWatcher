@@ -33,7 +33,9 @@ namespace MEAI.FileClassificationWatcher
         // One entry per file currently being tracked after a Changed event, so rapid-fire
         // saves reset the same timer instead of spawning duplicate watchers.
         private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingCloseWatches = new();
-
+        private readonly ConcurrentDictionary<string, DateTime> _selfAppliedUtc =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan SelfWriteSuppressWindow = TimeSpan.FromSeconds(8);
         public FileClassificationService(WatcherConfig config)
         {
             _config = config;
@@ -84,6 +86,14 @@ namespace MEAI.FileClassificationWatcher
             if (ClassificationSidecar.IsSidecarFile(path)) return true;
             if (name.StartsWith("~$") || name.StartsWith(".~")) return true; // Office/editor temp locks
             if (Directory.Exists(path)) return true; // it's a folder, not a file
+
+            // NEW: ignore the echo Changed event caused by our own headless
+            // COM save in OfficeDocumentClassifier.Apply — otherwise the tool
+            // re-prompts itself in an infinite loop on the file it just wrote.
+            // In ShouldIgnore:
+            if (_selfAppliedUtc.TryGetValue(path, out var selfWriteTime)
+                && File.GetLastWriteTimeUtc(path) == selfWriteTime)
+                return true; // this Changed event is exactly the write we just made
 
             // WHITELIST: only act on extensions explicitly opted in.
             var ext = Path.GetExtension(path);
@@ -354,6 +364,7 @@ namespace MEAI.FileClassificationWatcher
             var currentLevel = ClassificationLevelExtensions.Parse(currentFromApi);
             var isNew = currentLevel == null;
 
+
             var headline = isNew
                 ? "This file has no classification yet.\nSelect a classification level:"
                 : "Confirm the classification for this updated file.";
@@ -384,9 +395,12 @@ namespace MEAI.FileClassificationWatcher
             // Secret/TopSecret; staying at the same Secret/TopSecret level leaves whatever
             // password is already embedded in the file untouched (we never asked the user
             // to retype a password they already set moments/days ago).
+            var knownPassword = PasswordStore.TryGet(documentGuid);
+            bool fileAlreadyPassworded = knownPassword != null;
             string? passwordAction = null;
             bool needsSecretLevel = newLevel == ClassificationLevel.Secret || newLevel == ClassificationLevel.TopSecret;
             bool wasSecretLevel = currentLevel == ClassificationLevel.Secret || currentLevel == ClassificationLevel.TopSecret;
+
 
             if (needsSecretLevel && (isNew || !wasSecretLevel || levelChanged))
             {
@@ -409,7 +423,20 @@ namespace MEAI.FileClassificationWatcher
                 passwordAction = string.Empty; // downgraded below Secret — clear the old password
             }
 
-            var applied = OfficeDocumentClassifier.Apply(path, newLevel, passwordAction);
+            if (needsSecretLevel && !fileAlreadyPassworded)
+            {
+                passwordAction = PromptForPassword(path, newLevel, allowCancel: !isNew);
+                if (passwordAction == null) return;
+                PasswordStore.Save(documentGuid, passwordAction); // remember it — this is the missing piece
+            }
+            else if (!needsSecretLevel && fileAlreadyPassworded)
+            {
+                passwordAction = string.Empty; // downgrading below Secret — clear it
+                PasswordStore.Delete(documentGuid);
+            }
+
+            var applied = OfficeDocumentClassifier.Apply(path, newLevel, passwordAction, knownPassword);
+            _selfAppliedUtc[path] = File.GetLastWriteTimeUtc(path);   // NEW — stops the echo before it can queue another watch
             if (!applied)
             {
                 Logger.LogError($"HandleOfficeFileClosedAsync: failed to apply classification to '{path}'",

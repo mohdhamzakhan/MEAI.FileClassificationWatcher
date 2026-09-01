@@ -20,7 +20,7 @@ namespace MEAI.FileClassificationWatcher
         private const int MaxOpenRetries = 3;
         private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
 
-        public static bool Apply(string path, ClassificationLevel level, string? passwordAction)
+        public static bool Apply(string path, ClassificationLevel level, string? passwordAction, string? openPassword = null)
         {
             var ext = Path.GetExtension(path).ToLowerInvariant();
             return ext switch
@@ -38,7 +38,7 @@ namespace MEAI.FileClassificationWatcher
             return ext is ".docx" or ".doc" or ".xlsx" or ".xls" or ".pptx" or ".ppt";
         }
 
-        private static bool ApplyToWord(string path, ClassificationLevel level, string? passwordAction)
+        private static bool ApplyToWord(string path, ClassificationLevel level, string? passwordAction, string? openPassword = null)
         {
             Microsoft.Office.Interop.Word.Application? app = null;
             Microsoft.Office.Interop.Word.Document? doc = null;
@@ -50,7 +50,8 @@ namespace MEAI.FileClassificationWatcher
                     DisplayAlerts = 0,
                     AutomationSecurity = Microsoft.Office.Core.MsoAutomationSecurity.msoAutomationSecurityLow
                 };
-                doc = OpenWithRetry(() => app.Documents.Open(path, ReadOnly: false, AddToRecentFiles: false, Visible: false));
+                doc = OpenWithRetry(() => app.Documents.Open(path, ReadOnly: false, AddToRecentFiles: false,
+                             Visible: false, PasswordDocument: openPassword ?? ""));
                 if (doc == null) return false;
 
                 WriteCustomProperty(doc.CustomDocumentProperties, level.ToString());
@@ -71,14 +72,15 @@ namespace MEAI.FileClassificationWatcher
             }
         }
 
-        private static bool ApplyToExcel(string path, ClassificationLevel level, string? passwordAction)
+        private static bool ApplyToExcel(string path, ClassificationLevel level, string? passwordAction, string? openPassword = null)
         {
             Microsoft.Office.Interop.Excel.Application? app = null;
             Microsoft.Office.Interop.Excel.Workbook? wb = null;
             try
             {
                 app = new Microsoft.Office.Interop.Excel.Application { Visible = false, DisplayAlerts = false, AutomationSecurity = Microsoft.Office.Core.MsoAutomationSecurity.msoAutomationSecurityLow };
-                wb = OpenWithRetry(() => app.Workbooks.Open(path, ReadOnly: false, UpdateLinks: false));
+                wb = OpenWithRetry(() => app.Workbooks.Open(path, ReadOnly: false, UpdateLinks: false,
+                                    Password: openPassword ?? ""));
                 if (wb == null) return false;
 
                 WriteCustomProperty(wb.CustomDocumentProperties, level.ToString());
@@ -151,34 +153,33 @@ namespace MEAI.FileClassificationWatcher
             setPassword(passwordAction);
         }
 
-        private static void WriteCustomProperty(object customPropsObj, string value)
-        {
-            const string propName = "MEAI_Classification";
-            try
-            {
-                dynamic props = customPropsObj;
-                try { props[propName].Delete(); } catch { /* didn't exist yet */ }
-                props.Add(propName, false, Microsoft.Office.Core.MsoDocProperties.msoPropertyTypeString, value);
-            }
-            catch
-            {
-                // best effort — if the property collection is unavailable for some reason,
-                // the file still gets its Category set and password applied below
-            }
-        }
-
         private static void WriteCategory(object builtInPropsObj, ClassificationLevel level)
-        {
-            try
-            {
-                dynamic props = builtInPropsObj;
-                props["Category"].Value = level.ToDisplayName();
-            }
-            catch
-            {
-                // standard built-in property, should always exist — defensive only
-            }
-        }
+{
+    try
+    {
+        dynamic props = builtInPropsObj;
+        props["Category"].Value = level.ToDisplayName();
+    }
+    catch (Exception ex)
+    {
+        Logger.LogError("WriteCategory failed to set Category property", ex);
+    }
+}
+
+private static void WriteCustomProperty(object customPropsObj, string value)
+{
+    const string propName = "MEAI_Classification";
+    try
+    {
+        dynamic props = customPropsObj;
+        try { props[propName].Delete(); } catch { /* didn't exist yet */ }
+        props.Add(propName, false, Microsoft.Office.Core.MsoDocProperties.msoPropertyTypeString, value);
+    }
+    catch (Exception ex)
+    {
+        Logger.LogError("WriteCustomProperty failed to set MEAI_Classification property", ex);
+    }
+}
 
         private static T? OpenWithRetry<T>(Func<T> openAction) where T : class
         {
