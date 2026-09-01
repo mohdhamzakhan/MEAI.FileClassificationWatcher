@@ -61,6 +61,8 @@ namespace MEAI.FileClassificationWatcher
                 WriteCategory(doc.BuiltInDocumentProperties, level);
                 ApplyPassword(passwordAction, v => doc.Password = v);
 
+                doc.Saved = false;
+
                 SaveWithRetry(path, doc.Save, () => doc.ProtectionType.ToString());
                 return true;
             }
@@ -93,6 +95,8 @@ namespace MEAI.FileClassificationWatcher
                 dynamic excelWb = wb;
                 WriteCategory(excelWb.BuiltInDocumentProperties, level);
                 ApplyPassword(passwordAction, () => wb.Password, v => wb.Password = v);
+
+                wb.Saved = false;
 
                 SaveWithRetry(path, wb.Save, () => "n/a");
                 return true;
@@ -131,6 +135,8 @@ namespace MEAI.FileClassificationWatcher
                 WriteCustomProperty(pres.CustomDocumentProperties, level.ToString());
                 WriteCategory(pres.BuiltInDocumentProperties, level);
                 ApplyPassword(passwordAction, () => pres.Password, v => pres.Password = v);
+
+                pres.Saved = Microsoft.Office.Core.MsoTriState.msoFalse;
 
                 SaveWithRetry(path, pres.Save, () => "n/a");
                 return true;
