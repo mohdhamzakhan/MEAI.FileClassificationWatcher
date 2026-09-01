@@ -25,8 +25,8 @@ namespace MEAI.FileClassificationWatcher
             var ext = Path.GetExtension(path).ToLowerInvariant();
             return ext switch
             {
-                ".docx" or ".doc" => ApplyToWord(path, level, passwordAction),
-                ".xlsx" or ".xls" => ApplyToExcel(path, level, passwordAction),
+                ".docx" or ".doc" => ApplyToWord(path, level, passwordAction, openPassword),
+                ".xlsx" or ".xls" => ApplyToExcel(path, level, passwordAction, openPassword),
                 ".pptx" or ".ppt" => ApplyToPowerPoint(path, level, passwordAction),
                 _ => false,
             };

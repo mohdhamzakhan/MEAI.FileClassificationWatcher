@@ -399,35 +399,12 @@ namespace MEAI.FileClassificationWatcher
             bool fileAlreadyPassworded = knownPassword != null;
             string? passwordAction = null;
             bool needsSecretLevel = newLevel == ClassificationLevel.Secret || newLevel == ClassificationLevel.TopSecret;
-            bool wasSecretLevel = currentLevel == ClassificationLevel.Secret || currentLevel == ClassificationLevel.TopSecret;
-
-
-            if (needsSecretLevel && (isNew || !wasSecretLevel || levelChanged))
-            {
-                // Non-cancelable when this is a mandatory (brand-new/unclassified) prompt —
-                // matches ClassificationPromptForm's own "no way out" rule for that case.
-                // Only a re-confirmation of an already-classified file allows backing out.
-                passwordAction = PromptForPassword(path, newLevel, allowCancel: !isNew);
-                if (passwordAction == null)
-                {
-                    // User cancelled password entry. If this classification is mandatory
-                    // (brand new file), PasswordEntryForm doesn't allow cancelling in that
-                    // case, so this branch only triggers on a re-confirmation of an
-                    // already-classified file — safest move is to not apply anything this
-                    // cycle rather than label it Secret/TopSecret with no password.
-                    return;
-                }
-            }
-            else if (!needsSecretLevel && wasSecretLevel)
-            {
-                passwordAction = string.Empty; // downgraded below Secret — clear the old password
-            }
 
             if (needsSecretLevel && !fileAlreadyPassworded)
             {
                 passwordAction = PromptForPassword(path, newLevel, allowCancel: !isNew);
                 if (passwordAction == null) return;
-                PasswordStore.Save(documentGuid, passwordAction); // remember it — this is the missing piece
+                PasswordStore.Save(documentGuid, passwordAction);
             }
             else if (!needsSecretLevel && fileAlreadyPassworded)
             {
