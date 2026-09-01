@@ -59,6 +59,7 @@ namespace MEAI.FileClassificationWatcher
 
                 WriteCustomProperty(doc.CustomDocumentProperties, level.ToString());
                 WriteCategory(doc.BuiltInDocumentProperties, level);
+                WriteWordHeader(doc, level);
                 ApplyPassword(passwordAction, v => doc.Password = v);
 
                 doc.Saved = false;
@@ -94,6 +95,7 @@ namespace MEAI.FileClassificationWatcher
                 WriteCustomProperty(wb.CustomDocumentProperties, level.ToString());
                 dynamic excelWb = wb;
                 WriteCategory(excelWb.BuiltInDocumentProperties, level);
+                WriteExcelHeader(wb, level);
                 ApplyPassword(passwordAction, () => wb.Password, v => wb.Password = v);
 
                 wb.Saved = false;
@@ -134,6 +136,7 @@ namespace MEAI.FileClassificationWatcher
 
                 WriteCustomProperty(pres.CustomDocumentProperties, level.ToString());
                 WriteCategory(pres.BuiltInDocumentProperties, level);
+                WritePowerPointHeader(pres, level);
                 ApplyPassword(passwordAction, () => pres.Password, v => pres.Password = v);
 
                 pres.Saved = Microsoft.Office.Core.MsoTriState.msoFalse;
@@ -290,6 +293,85 @@ namespace MEAI.FileClassificationWatcher
 
             GC.Collect();
             GC.WaitForPendingFinalizers();
+        }
+
+        private static void WriteWordHeader(Microsoft.Office.Interop.Word.Document doc, ClassificationLevel level)
+        {
+            try
+            {
+                foreach (Microsoft.Office.Interop.Word.Section section in doc.Sections)
+                {
+                    var header = section.Headers[Microsoft.Office.Interop.Word.WdHeaderFooterIndex.wdHeaderFooterPrimary];
+                    header.Range.Text = $"Classification: {level.ToDisplayName()}";
+                    header.Range.ParagraphFormat.Alignment = Microsoft.Office.Interop.Word.WdParagraphAlignment.wdAlignParagraphRight;
+                    header.Range.Font.Bold = 1;
+                    header.Range.Font.Size = 10;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("WriteWordHeader failed to set header text", ex);
+            }
+        }
+
+        private static void WriteExcelHeader(Microsoft.Office.Interop.Excel.Workbook wb, ClassificationLevel level)
+        {
+            try
+            {
+                string headerText = $"&B&U&10Classification: {level.ToDisplayName()}"; // &B = Bold, &10 = 10pt font
+
+                foreach (Microsoft.Office.Interop.Excel.Worksheet sheet in wb.Worksheets)
+                {
+                    sheet.PageSetup.CenterHeader = headerText;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("WriteExcelHeader failed to set header text", ex);
+            }
+        }
+
+        private static void WritePowerPointHeader(Microsoft.Office.Interop.PowerPoint.Presentation pres, ClassificationLevel level)
+        {
+            const string bannerName = "MEAI_ClassificationHeader";
+            string text = $"Classification: {level.ToDisplayName()}";
+
+            try
+            {
+                // Iterate through all design slide masters in the presentation
+                for (int d = 1; d <= pres.Designs.Count; d++)
+                {
+                    var master = pres.Designs[d].SlideMaster;
+
+                    // Remove any previously applied classification banner
+                    for (int s = master.Shapes.Count; s >= 1; s--)
+                    {
+                        if (master.Shapes[s].Name == bannerName)
+                        {
+                            master.Shapes[s].Delete();
+                        }
+                    }
+
+                    // Create a full-width header banner at the top (Y = 0)
+                    float slideWidth = pres.PageSetup.SlideWidth;
+                    var banner = master.Shapes.AddTextbox(
+                        Microsoft.Office.Core.MsoTextOrientation.msoTextOrientationHorizontal,
+                        Left: 0,
+                        Top: 0,
+                        Width: slideWidth,
+                        Height: 18);
+
+                    banner.Name = bannerName;
+                    banner.TextFrame.TextRange.Text = text;
+                    banner.TextFrame.TextRange.ParagraphFormat.Alignment = Microsoft.Office.Interop.PowerPoint.PpParagraphAlignment.ppAlignCenter;
+                    banner.TextFrame.TextRange.Font.Size = 10;
+                    banner.TextFrame.TextRange.Font.Bold = Microsoft.Office.Core.MsoTriState.msoTrue;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("WritePowerPointHeader failed to set master banner", ex);
+            }
         }
     }
 }

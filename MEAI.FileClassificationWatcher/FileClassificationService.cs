@@ -72,17 +72,25 @@ namespace MEAI.FileClassificationWatcher
                 watcher.Changed += (_, e) => OnChanged(e.FullPath);
                 watcher.Renamed += (_, e) =>
                 {
-                    // Cancel any in-flight watch for the OLD path — it's about to point at a
-                    // file that no longer exists (classic Explorer "New file" flow: create,
-                    // then immediately rename while still in the inline-edit box). Without
-                    // this, the stale watch runs to completion and OfficeDocumentClassifier
-                    // fails with "couldn't find <old name>" once the popup/Apply cycle
-                    // catches up to a file that's already been renamed away.
+                    // Cancel any in-flight watch for the OLD path
                     if (_pendingCloseWatches.TryRemove(e.OldFullPath, out var staleCts))
                         staleCts.Cancel();
-                    OnChanged(e.FullPath);
+
+                    if (OfficeDocumentClassifier.IsOfficeFormat(e.FullPath))
+                    {
+                        Task.Run(async () =>
+                        {
+                            // Just a tiny 500ms delay to let Explorer's rename lock clear, 
+                            // then immediately prompt the user BEFORE they can double-click it.
+                            await Task.Delay(500);
+                            if (File.Exists(e.FullPath)) QueueCloseWatch(e.FullPath);
+                        });
+                    }
+                    else
+                    {
+                        OnChanged(e.FullPath);
+                    }
                 };
-                _watchers.Add(watcher);
             }
         }
 
@@ -205,7 +213,7 @@ namespace MEAI.FileClassificationWatcher
                     // would otherwise fire almost instantly and pop the classification
                     // prompt against the placeholder name (e.g. "New Word Document.docx")
                     // before the rename ever lands on disk.
-                    await Task.Delay(TimeSpan.FromSeconds(4));
+                    await Task.Delay(TimeSpan.FromSeconds(3));
                     if (!File.Exists(path)) return; // renamed away during the settle window
                                                     // — the Renamed handler already queued
                                                     // a fresh watch for the new name
@@ -256,6 +264,25 @@ namespace MEAI.FileClassificationWatcher
         {
             if (ShouldIgnore(path)) return;
             if (!File.Exists(path)) return;
+
+            // FIX: Explorer fires a Changed event immediately after Created. For Office files, 
+            // OnCreated introduces a 4-second delay so the user can rename the file. 
+            // We must ignore the immediate Changed event so we don't bypass that delay.
+            if (OfficeDocumentClassifier.IsOfficeFormat(path))
+            {
+                try
+                {
+                    // If the file is less than 5 seconds old, ignore this Changed event
+                    // UNLESS we already have an active watch pending for it.
+                    if (DateTime.UtcNow - File.GetCreationTimeUtc(path) < TimeSpan.FromSeconds(5))
+                    {
+                        if (!_pendingCloseWatches.ContainsKey(path))
+                            return; // Let OnCreated's Task.Delay handle it
+                    }
+                }
+                catch { } // Ignore read errors, fall through to queue
+            }
+
             QueueCloseWatch(path);
         }
 
@@ -478,6 +505,22 @@ namespace MEAI.FileClassificationWatcher
                     PreviousClassification = currentFromApi,
                     Classification = newLevel.ToString()
                 });
+
+                if (applied && isNew)
+                {
+                    try
+                    {
+                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = path,
+                            UseShellExecute = true
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogError("Failed to auto-open file after classification.", ex);
+                    }
+                }
             }
             finally
             {
