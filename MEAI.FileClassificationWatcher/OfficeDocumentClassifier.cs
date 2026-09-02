@@ -28,14 +28,18 @@ namespace MEAI.FileClassificationWatcher
                 ".docx" or ".doc" => ApplyToWord(path, level, passwordAction, openPassword),
                 ".xlsx" or ".xls" => ApplyToExcel(path, level, passwordAction, openPassword),
                 ".pptx" or ".ppt" => ApplyToPowerPoint(path, level, passwordAction),
+                ".pdf" => ApplyToPdf(path, level, passwordAction, openPassword),
                 _ => false,
             };
         }
 
+        // NOTE: name predates PDF support — kept as-is to avoid touching every call site
+        // in FileClassificationService for a rename. Functionally this now means "formats
+        // this classifier knows how to write embedded metadata/a visible banner into."
         public static bool IsOfficeFormat(string path)
         {
             var ext = Path.GetExtension(path).ToLowerInvariant();
-            return ext is ".docx" or ".doc" or ".xlsx" or ".xls" or ".pptx" or ".ppt";
+            return ext is ".docx" or ".doc" or ".xlsx" or ".xls" or ".pptx" or ".ppt" or ".pdf";
         }
 
         private static bool ApplyToWord(string path, ClassificationLevel level, string? passwordAction, string? openPassword = null)
@@ -248,6 +252,462 @@ namespace MEAI.FileClassificationWatcher
                 catch (Exception ex)
                 {
                     Logger.LogError($"WriteWordHeader failed for a section in '{path}'", ex);
+                }
+            }
+        }
+        private static bool ApplyToPdf(
+     string path,
+     ClassificationLevel level,
+     string? passwordAction,
+     string? existingPassword)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                    return false;
+
+                ClearReadOnlyAttribute(path);
+
+                bool hasExistingPassword =
+                    !string.IsNullOrWhiteSpace(existingPassword);
+
+                bool removePassword =
+                    passwordAction != null &&
+                    passwordAction.Length == 0;
+
+                bool setPassword =
+                    !string.IsNullOrWhiteSpace(passwordAction);
+
+                // =========================================================
+                // SECRET/TOP SECRET -> CONFIDENTIAL/PUBLIC
+                // Existing PDF is encrypted and password must be removed.
+                // =========================================================
+
+                if (hasExistingPassword && removePassword)
+                {
+                    Logger.LogInfo(
+                        $"ApplyToPdf: '{path}' requires encrypted-to-unencrypted " +
+                        "conversion using the existing password.");
+
+                    return RemovePdfPassword(
+                        path,
+                        level,
+                        existingPassword!);
+                }
+
+                // =========================================================
+                // Existing encrypted PDF -> remain encrypted
+                // =========================================================
+
+                if (hasExistingPassword)
+                {
+                    return ModifyEncryptedPdf(
+                        path,
+                        level,
+                        existingPassword!,
+                        setPassword ? passwordAction : null);
+                }
+
+                // =========================================================
+                // Existing unencrypted PDF
+                // =========================================================
+
+                return ModifyUnencryptedPdf(
+                    path,
+                    level,
+                    setPassword ? passwordAction : null);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(
+                    $"OfficeDocumentClassifier.ApplyToPdf failed for '{path}'",
+                    ex);
+
+                return false;
+            }
+        }
+
+        private static bool RemovePdfPassword(
+    string path,
+    ClassificationLevel level,
+    string existingPassword)
+        {
+            string? tempPath = null;
+
+            try
+            {
+                if (!File.Exists(path))
+                    return false;
+
+                if (string.IsNullOrWhiteSpace(existingPassword))
+                {
+                    Logger.LogError(
+                        $"RemovePdfPassword: '{path}' is password protected but no existing password was supplied.",
+                        new Exception("Existing PDF password is required."));
+
+                    return false;
+                }
+
+                ClearReadOnlyAttribute(path);
+
+                tempPath = path + ".meaitmp";
+
+                // ----------------------------------------------------
+                // Open the existing encrypted PDF using its password.
+                //
+                // IMPORTANT:
+                // PdfDocumentOpenMode.Modify is required because we
+                // want to modify and save the existing document.
+                // ----------------------------------------------------
+
+                using var document =
+                    PdfSharpCore.Pdf.IO.PdfReader.Open(
+                        path,
+                        existingPassword,
+                        PdfSharpCore.Pdf.IO.PdfDocumentOpenMode.Modify);
+
+                if (document == null)
+                {
+                    Logger.LogError(
+                        $"RemovePdfPassword: PdfReader.Open returned null for '{path}'.",
+                        new Exception("Unable to open PDF."));
+
+                    return false;
+                }
+
+                // ----------------------------------------------------
+                // Do not modify digitally signed PDFs.
+                // ----------------------------------------------------
+
+                if (LooksDigitallySigned(document))
+                {
+                    Logger.LogInfo(
+                        $"RemovePdfPassword: '{path}' appears to be digitally signed/certified. " +
+                        "Skipping modification because changing the PDF would invalidate the signature.");
+
+                    return false;
+                }
+
+                // ----------------------------------------------------
+                // Update classification metadata.
+                // ----------------------------------------------------
+
+                WritePdfInfoProperties(document, level);
+
+                // If you use a visible classification header, enable it.
+                // WritePdfHeader(document, path, level);
+
+                // ----------------------------------------------------
+                // REMOVE PDF ENCRYPTION
+                // ----------------------------------------------------
+                //
+                // Do NOT do:
+                //
+                // document.SecuritySettings.UserPassword = null;
+                // document.SecuritySettings.OwnerPassword = null;
+                //
+                // That is what caused:
+                //
+                // "At least a user or an owner password is required
+                // to encrypt the document."
+                //
+                // Instead, explicitly set the security level to None.
+                // PdfSharpCore's Save() then removes the /Encrypt
+                // entry from the PDF trailer.
+                // ----------------------------------------------------
+
+                document.SecuritySettings.DocumentSecurityLevel =
+                    PdfSharpCore.Pdf.Security.PdfDocumentSecurityLevel.None;
+
+                // ----------------------------------------------------
+                // Save to temporary file first.
+                // ----------------------------------------------------
+
+                document.Save(tempPath);
+
+                if (!File.Exists(tempPath))
+                {
+                    Logger.LogError(
+                        $"RemovePdfPassword: temporary PDF was not created for '{path}'.",
+                        new Exception("PDF save failed."));
+
+                    return false;
+                }
+
+                // ----------------------------------------------------
+                // Replace original only after successful Save().
+                // ----------------------------------------------------
+
+                File.Copy(
+                    tempPath,
+                    path,
+                    overwrite: true);
+
+                File.Delete(tempPath);
+                tempPath = null;
+
+                Logger.LogInfo(
+                    $"RemovePdfPassword: password removed successfully from '{path}'. " +
+                    $"Classification changed to {level}.");
+
+                return true;
+            }
+            catch (PdfSharpCore.Pdf.IO.PdfReaderException ex)
+            {
+                Logger.LogError(
+                    $"RemovePdfPassword: unable to open '{path}' with the supplied password.",
+                    ex);
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(
+                    $"RemovePdfPassword failed for '{path}'.",
+                    ex);
+
+                return false;
+            }
+            finally
+            {
+                // Clean up temporary file if something failed.
+                if (!string.IsNullOrWhiteSpace(tempPath))
+                {
+                    try
+                    {
+                        if (File.Exists(tempPath))
+                            File.Delete(tempPath);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        Logger.LogError(
+                            $"RemovePdfPassword: failed to delete temporary file '{tempPath}'.",
+                            cleanupEx);
+                    }
+                }
+            }
+        }
+
+        private static bool ModifyUnencryptedPdf(
+    string path,
+    ClassificationLevel level,
+    string? newPassword)
+        {
+            try
+            {
+                var tempPath = path + ".meaitmp";
+
+                using var document =
+                    PdfSharpCore.Pdf.IO.PdfReader.Open(
+                        path,
+                        PdfSharpCore.Pdf.IO.PdfDocumentOpenMode.Modify);
+
+                if (LooksDigitallySigned(document))
+                {
+                    Logger.LogInfo(
+                        $"ApplyToPdf: '{path}' appears to be digitally signed/certified. " +
+                        "Skipping modification.");
+
+                    return false;
+                }
+
+                WritePdfInfoProperties(document, level);
+
+                // Optional visible header
+                // WritePdfHeader(document, path, level);
+
+                if (!string.IsNullOrWhiteSpace(newPassword))
+                {
+                    document.SecuritySettings.UserPassword = newPassword;
+
+                    document.SecuritySettings.PermitPrint = false;
+                    document.SecuritySettings.PermitModifyDocument = false;
+                    document.SecuritySettings.PermitExtractContent = false;
+                    document.SecuritySettings.PermitAnnotations = false;
+                    document.SecuritySettings.PermitFormsFill = false;
+                    document.SecuritySettings.PermitAccessibilityExtractContent = false;
+                    document.SecuritySettings.PermitAssembleDocument = false;
+                    document.SecuritySettings.PermitFullQualityPrint = false;
+                }
+
+                document.Save(tempPath);
+
+                ReplaceFileSafely(tempPath, path);
+
+                Logger.LogInfo(
+                    $"ApplyToPdf: '{path}' successfully classified as {level}.");
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(
+                    $"ModifyUnencryptedPdf failed for '{path}'",
+                    ex);
+
+                return false;
+            }
+        }
+
+        private static bool ModifyEncryptedPdf(
+    string path,
+    ClassificationLevel level,
+    string existingPassword,
+    string? newPassword)
+        {
+            try
+            {
+                var tempPath = path + ".meaitmp";
+
+                using var document =
+                    PdfSharpCore.Pdf.IO.PdfReader.Open(
+                        path,
+                        existingPassword,
+                       PdfSharpCore.Pdf.IO.PdfDocumentOpenMode.Modify);
+
+                if (LooksDigitallySigned(document))
+                {
+                    Logger.LogInfo(
+                        $"ApplyToPdf: '{path}' appears to be digitally signed/certified. " +
+                        "Skipping modification.");
+
+                    return false;
+                }
+
+                WritePdfInfoProperties(document, level);
+
+                // If no new password is supplied, keep the existing
+                // encryption/password unchanged.
+                if (!string.IsNullOrWhiteSpace(newPassword))
+                {
+                    document.SecuritySettings.UserPassword = newPassword;
+
+                    document.SecuritySettings.PermitPrint = false;
+                    document.SecuritySettings.PermitModifyDocument = false;
+                    document.SecuritySettings.PermitExtractContent = false;
+                    document.SecuritySettings.PermitAnnotations = false;
+                    document.SecuritySettings.PermitFormsFill = false;
+                    document.SecuritySettings.PermitAccessibilityExtractContent = false;
+                    document.SecuritySettings.PermitAssembleDocument = false;
+                    document.SecuritySettings.PermitFullQualityPrint = false;
+                }
+
+                document.Save(tempPath);
+
+                ReplaceFileSafely(tempPath, path);
+
+                Logger.LogInfo(
+                    $"ApplyToPdf: encrypted PDF '{path}' successfully classified as {level}.");
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(
+                    $"ModifyEncryptedPdf failed for '{path}'",
+                    ex);
+
+                return false;
+            }
+        }
+
+        private static void ReplaceFileSafely(
+    string tempPath,
+    string originalPath)
+        {
+            if (!File.Exists(tempPath))
+                throw new FileNotFoundException(
+                    "Temporary PDF was not created.",
+                    tempPath);
+
+            File.Copy(
+                tempPath,
+                originalPath,
+                overwrite: true);
+
+            File.Delete(tempPath);
+        }
+        // Defensive, best-effort check: treats "can't tell" as "assume signed" rather than
+        // "assume safe to modify" — same fail-safe philosophy used elsewhere in this
+        // codebase (ownership/lock checks default to skipping rather than risking harm).
+        // Checks two standard indicators: an AcroForm with SigFlags bit 1 set (a signature
+        // field exists), or a /Perms entry in the document catalog (used by certified/
+        // "author signed" documents to restrict what can change post-signing).
+        private static bool LooksDigitallySigned(PdfSharpCore.Pdf.PdfDocument document)
+        {
+            try
+            {
+                var catalog = document.Internals.Catalog;
+
+                if (catalog.Elements.ContainsKey("/Perms"))
+                    return true;
+
+                if (catalog.Elements.ContainsKey("/AcroForm"))
+                {
+                    var acroForm = catalog.Elements.GetDictionary("/AcroForm");
+                    var sigFlags = acroForm?.Elements.GetInteger("/SigFlags") ?? 0;
+                    if ((sigFlags & 0x1) != 0) // bit 1: SignaturesExist
+                        return true;
+                }
+
+                return false;
+            }
+            catch
+            {
+                // Couldn't inspect the structure at all — treat as signed to be safe.
+                return true;
+            }
+        }
+
+        // PDF has no field called "Category" — the closest built-in equivalent is
+        // Keywords, the standard Info-dictionary field every PDF viewer's Document
+        // Properties panel shows. Also set a custom Info key for our own exact-match
+        // lookups, same idea as WriteCustomProperty for the Office formats — PDF's Info
+        // dictionary explicitly allows arbitrary extra keys beyond the standard ones.
+        private static void WritePdfInfoProperties(PdfSharpCore.Pdf.PdfDocument document, ClassificationLevel level)
+        {
+            try
+            {
+                document.Info.Keywords = level.ToDisplayName();
+                document.Info.Elements.SetString("/MEAI_Classification", level.ToString());
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("WritePdfInfoProperties failed to set Keywords/MEAI_Classification", ex);
+            }
+        }
+
+        // Same visible-marking approach as WriteExcelHeader/WriteWordHeader: a bold,
+        // color-coded banner stamped onto every page. XGraphicsPdfPageOptions.Append draws
+        // ON TOP of each page's existing content rather than replacing it — the same
+        // technique a watermark/stamp tool uses.
+        private static void WritePdfHeader(PdfSharpCore.Pdf.PdfDocument document, string path, ClassificationLevel level)
+        {
+            var color = level switch
+            {
+                ClassificationLevel.TopSecret => PdfSharpCore.Drawing.XColor.FromArgb(0xC0, 0x00, 0x00),   // dark red
+                ClassificationLevel.Secret => PdfSharpCore.Drawing.XColor.FromArgb(0xED, 0x7D, 0x31),       // orange
+                ClassificationLevel.Confidential => PdfSharpCore.Drawing.XColor.FromArgb(0x2E, 0x75, 0xB6), // blue
+                ClassificationLevel.Public => PdfSharpCore.Drawing.XColor.FromArgb(0x54, 0x82, 0x35),       // green
+                _ => PdfSharpCore.Drawing.XColor.FromArgb(0x00, 0x00, 0x00),
+            };
+            var bannerText = $"Classification {level.ToDisplayName().ToUpperInvariant()}";
+            var font = new PdfSharpCore.Drawing.XFont("Arial", 10, PdfSharpCore.Drawing.XFontStyle.Bold);
+            var brush = new PdfSharpCore.Drawing.XSolidBrush(color);
+
+            foreach (var page in document.Pages)
+            {
+                try
+                {
+                    using var gfx = PdfSharpCore.Drawing.XGraphics.FromPdfPage(
+                        page, PdfSharpCore.Drawing.XGraphicsPdfPageOptions.Append);
+
+                    var rect = new PdfSharpCore.Drawing.XRect(0, 8, page.Width, 20);
+                    gfx.DrawString(bannerText, font, brush, rect, PdfSharpCore.Drawing.XStringFormats.TopCenter);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"WritePdfHeader failed for a page in '{path}'", ex);
                 }
             }
         }

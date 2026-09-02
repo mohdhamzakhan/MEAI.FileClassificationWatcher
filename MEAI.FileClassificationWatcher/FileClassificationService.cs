@@ -574,6 +574,7 @@ namespace MEAI.FileClassificationWatcher
                         ".docx" or ".doc" => "Word",
                         ".xlsx" or ".xls" => "Excel",
                         ".pptx" or ".ppt" => "PowerPoint",
+                        "pdf" => "PDF",
                         _ => "File"
                     },
                     DocumentName = Path.GetFileName(path),
