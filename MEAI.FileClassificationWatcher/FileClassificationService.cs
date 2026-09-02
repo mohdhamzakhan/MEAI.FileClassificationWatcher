@@ -1,6 +1,5 @@
 ﻿using System.Collections.Concurrent;
 using System.Security.Cryptography;
-using System.Security.Principal;
 
 namespace MEAI.FileClassificationWatcher
 {
@@ -66,31 +65,35 @@ namespace MEAI.FileClassificationWatcher
                 {
                     IncludeSubdirectories = true,
                     NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+                    // Default is 8KB, sized for watching a single folder. Now that
+                    // WatcherConfig watches entire drives, event volume is much higher —
+                    // 64KB is the documented maximum Microsoft recommends (larger causes
+                    // paged-memory issues); this reduces, though doesn't eliminate, the
+                    // risk of the buffer overflowing and silently dropping events.
+                    InternalBufferSize = 64 * 1024,
                     EnableRaisingEvents = true
                 };
                 watcher.Created += (_, e) => Task.Run(() => OnCreated(e.FullPath));
-                watcher.Changed += (_, e) => OnChanged(e.FullPath);
+                // Dispatched via Task.Run for the same reason as Created: ShouldIgnore now
+                // calls LocalHandleChecker, which can block for up to ~600ms (a few retries
+                // against Restart Manager). Running that directly on FileSystemWatcher's own
+                // event-delivery thread would stall it long enough, under any real event
+                // volume, to risk overflowing its internal buffer and silently dropping
+                // events — a real risk now that whole drives are being watched.
+                watcher.Changed += (_, e) => Task.Run(() => OnChanged(e.FullPath));
                 watcher.Renamed += (_, e) =>
                 {
-                    // Cancel any in-flight watch for the OLD path
+                    // Cancel any in-flight watch for the OLD path — it's about to point at a
+                    // file that no longer exists (classic Explorer "New file" flow: create,
+                    // then immediately rename while still in the inline-edit box). Without
+                    // this, the stale watch runs to completion and OfficeDocumentClassifier
+                    // fails with "couldn't find <old name>" once the popup/Apply cycle
+                    // catches up to a file that's already been renamed away.
                     if (_pendingCloseWatches.TryRemove(e.OldFullPath, out var staleCts))
                         staleCts.Cancel();
-
-                    if (OfficeDocumentClassifier.IsOfficeFormat(e.FullPath))
-                    {
-                        Task.Run(async () =>
-                        {
-                            // Just a tiny 500ms delay to let Explorer's rename lock clear, 
-                            // then immediately prompt the user BEFORE they can double-click it.
-                            await Task.Delay(500);
-                            if (File.Exists(e.FullPath)) QueueCloseWatch(e.FullPath);
-                        });
-                    }
-                    else
-                    {
-                        OnChanged(e.FullPath);
-                    }
+                    Task.Run(() => OnChanged(e.FullPath));
                 };
+                _watchers.Add(watcher);
             }
         }
 
@@ -128,42 +131,29 @@ namespace MEAI.FileClassificationWatcher
             if (IsUnderExcludedFolder(path)) return true;
 
             // Watching a shared network folder means EVERY user's watcher instance sees
-            // EVERY file event in that folder — not just their own. Without this check,
-            // one person creating a file on a shared drive pops a classification dialog
-            // on every other user who happens to be watching the same folder, which is
-            // exactly the "very irritating" behavior this was reported as. Only react to
-            // files the current Windows user actually owns (created) — NTFS sets the
-            // creator as owner by default. If ownership can't be determined at all (e.g.
-            // restrictive share permissions), fail safe by skipping rather than risking
-            // prompting someone about a file that isn't theirs.
-            if (!IsOwnedByCurrentUser(path)) return true;
+            // EVERY file event in that folder — not just their own. This used to check
+            // NTFS ownership via GetAccessControl(), but that's NOT reliable over SMB/
+            // network shares: many network filesystems don't transmit true per-file owner
+            // metadata, and the client can end up reporting YOUR OWN identity as the
+            // "owner" of everything visible on the share — which is exactly why other
+            // users' files were still triggering prompts. Checking via Restart Manager
+            // instead asks a question that doesn't depend on the remote filesystem's ACL
+            // support at all: "does a process on THIS machine currently have this file
+            // open?" That's always accurate, since another physical machine's Word/Notepad
+            // process can never appear in this machine's local process/handle table.
+            if (!LocalHandleChecker.IsOpenByCurrentSession(path)) return true;
 
             return false;
         }
 
         // NOTE: this means a file someone else created is only ever handled by ITS
         // creator's own watcher instance — if a second person later edits that same
-        // shared file, their own watcher will not prompt them for it either, since
-        // ownership doesn't change on edit. That's an intentional trade-off: it's the
-        // simplest fix for the reported noise problem, but it does mean genuinely
-        // collaborative shared documents won't get a fresh confirmation from every editor,
-        // only from whoever originally created the file.
-        private static bool IsOwnedByCurrentUser(string path)
-        {
-            try
-            {
-                var security = new FileInfo(path).GetAccessControl();
-                var owner = security.GetOwner(typeof(NTAccount)) as NTAccount;
-                var currentUser = WindowsIdentity.GetCurrent().Name; // DOMAIN\username
-                return owner != null && string.Equals(owner.Value, currentUser, StringComparison.OrdinalIgnoreCase);
-            }
-            catch
-            {
-                // Can't read the ACL (common on locked-down shares for non-owners) —
-                // treat as "not mine" rather than risk prompting for someone else's file.
-                return false;
-            }
-        }
+        // shared file, their own watcher will not prompt them for it either, since by the
+        // time they touch it, it's no longer open by a process in their session at the
+        // exact instant our event fires (unless they themselves are the one editing it
+        // right then, in which case it correctly WILL prompt them). That's an intentional
+        // trade-off: simplest fix for the reported noise problem, at the cost of not
+        // guaranteeing every collaborative editor gets a fresh confirmation.
 
         private bool IsUnderExcludedFolder(string path)
         {
@@ -213,7 +203,7 @@ namespace MEAI.FileClassificationWatcher
                     // would otherwise fire almost instantly and pop the classification
                     // prompt against the placeholder name (e.g. "New Word Document.docx")
                     // before the rename ever lands on disk.
-                    await Task.Delay(TimeSpan.FromSeconds(3));
+                    await Task.Delay(TimeSpan.FromSeconds(4));
                     if (!File.Exists(path)) return; // renamed away during the settle window
                                                     // — the Renamed handler already queued
                                                     // a fresh watch for the new name
@@ -264,25 +254,6 @@ namespace MEAI.FileClassificationWatcher
         {
             if (ShouldIgnore(path)) return;
             if (!File.Exists(path)) return;
-
-            // FIX: Explorer fires a Changed event immediately after Created. For Office files, 
-            // OnCreated introduces a 4-second delay so the user can rename the file. 
-            // We must ignore the immediate Changed event so we don't bypass that delay.
-            if (OfficeDocumentClassifier.IsOfficeFormat(path))
-            {
-                try
-                {
-                    // If the file is less than 5 seconds old, ignore this Changed event
-                    // UNLESS we already have an active watch pending for it.
-                    if (DateTime.UtcNow - File.GetCreationTimeUtc(path) < TimeSpan.FromSeconds(5))
-                    {
-                        if (!_pendingCloseWatches.ContainsKey(path))
-                            return; // Let OnCreated's Task.Delay handle it
-                    }
-                }
-                catch { } // Ignore read errors, fall through to queue
-            }
-
             QueueCloseWatch(path);
         }
 
@@ -505,22 +476,6 @@ namespace MEAI.FileClassificationWatcher
                     PreviousClassification = currentFromApi,
                     Classification = newLevel.ToString()
                 });
-
-                if (applied && isNew)
-                {
-                    try
-                    {
-                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                        {
-                            FileName = path,
-                            UseShellExecute = true
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogError("Failed to auto-open file after classification.", ex);
-                    }
-                }
             }
             finally
             {
