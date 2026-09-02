@@ -27,5 +27,22 @@
                 // if we can't even write the log, there's nowhere left to report this
             }
         }
+
+        public static void LogInfo(string message)
+        {
+            try
+            {
+                Directory.CreateDirectory(_logFolder);
+                lock (_lock)
+                {
+                    File.AppendAllText(_logFile,
+                        $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}\n\n");
+                }
+            }
+            catch
+            {
+                // if we can't even write the log, there's nowhere left to report this
+            }
+        }
     }
 }

@@ -1,5 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using System.Security.Cryptography;
+using System.Security.Principal;
 
 namespace MEAI.FileClassificationWatcher
 {
@@ -65,22 +66,10 @@ namespace MEAI.FileClassificationWatcher
                 {
                     IncludeSubdirectories = true,
                     NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
-                    // Default is 8KB, sized for watching a single folder. Now that
-                    // WatcherConfig watches entire drives, event volume is much higher —
-                    // 64KB is the documented maximum Microsoft recommends (larger causes
-                    // paged-memory issues); this reduces, though doesn't eliminate, the
-                    // risk of the buffer overflowing and silently dropping events.
-                    InternalBufferSize = 64 * 1024,
                     EnableRaisingEvents = true
                 };
                 watcher.Created += (_, e) => Task.Run(() => OnCreated(e.FullPath));
-                // Dispatched via Task.Run for the same reason as Created: ShouldIgnore now
-                // calls LocalHandleChecker, which can block for up to ~600ms (a few retries
-                // against Restart Manager). Running that directly on FileSystemWatcher's own
-                // event-delivery thread would stall it long enough, under any real event
-                // volume, to risk overflowing its internal buffer and silently dropping
-                // events — a real risk now that whole drives are being watched.
-                watcher.Changed += (_, e) => Task.Run(() => OnChanged(e.FullPath));
+                watcher.Changed += (_, e) => OnChanged(e.FullPath);
                 watcher.Renamed += (_, e) =>
                 {
                     // Cancel any in-flight watch for the OLD path — it's about to point at a
@@ -91,7 +80,7 @@ namespace MEAI.FileClassificationWatcher
                     // catches up to a file that's already been renamed away.
                     if (_pendingCloseWatches.TryRemove(e.OldFullPath, out var staleCts))
                         staleCts.Cancel();
-                    Task.Run(() => OnChanged(e.FullPath));
+                    OnChanged(e.FullPath);
                 };
                 _watchers.Add(watcher);
             }
@@ -131,29 +120,53 @@ namespace MEAI.FileClassificationWatcher
             if (IsUnderExcludedFolder(path)) return true;
 
             // Watching a shared network folder means EVERY user's watcher instance sees
-            // EVERY file event in that folder — not just their own. This used to check
-            // NTFS ownership via GetAccessControl(), but that's NOT reliable over SMB/
-            // network shares: many network filesystems don't transmit true per-file owner
-            // metadata, and the client can end up reporting YOUR OWN identity as the
-            // "owner" of everything visible on the share — which is exactly why other
-            // users' files were still triggering prompts. Checking via Restart Manager
-            // instead asks a question that doesn't depend on the remote filesystem's ACL
-            // support at all: "does a process on THIS machine currently have this file
-            // open?" That's always accurate, since another physical machine's Word/Notepad
-            // process can never appear in this machine's local process/handle table.
-            if (!LocalHandleChecker.IsOpenByCurrentSession(path)) return true;
+            // EVERY file event in that folder — not just their own. Without this check,
+            // one person creating a file on a shared drive pops a classification dialog
+            // on every other user who happens to be watching the same folder, which is
+            // exactly the "very irritating" behavior this was reported as. Only react to
+            // files the current Windows user actually owns (created) — NTFS sets the
+            // creator as owner by default. If ownership can't be determined at all (e.g.
+            // restrictive share permissions), fail safe by skipping rather than risking
+            // prompting someone about a file that isn't theirs.
+            if (!IsOwnedByCurrentUser(path)) return true;
 
             return false;
         }
 
         // NOTE: this means a file someone else created is only ever handled by ITS
         // creator's own watcher instance — if a second person later edits that same
-        // shared file, their own watcher will not prompt them for it either, since by the
-        // time they touch it, it's no longer open by a process in their session at the
-        // exact instant our event fires (unless they themselves are the one editing it
-        // right then, in which case it correctly WILL prompt them). That's an intentional
-        // trade-off: simplest fix for the reported noise problem, at the cost of not
-        // guaranteeing every collaborative editor gets a fresh confirmation.
+        // shared file, their own watcher will not prompt them for it either, since
+        // ownership doesn't change on edit. That's an intentional trade-off: it's the
+        // simplest fix for the reported noise problem, but it does mean genuinely
+        // collaborative shared documents won't get a fresh confirmation from every editor,
+        // only from whoever originally created the file.
+        private static bool IsOwnedByCurrentUser(string path)
+        {
+            try
+            {
+                var security = new FileInfo(path).GetAccessControl();
+                var owner = security.GetOwner(typeof(NTAccount)) as NTAccount;
+                var currentUser = WindowsIdentity.GetCurrent().Name; // DOMAIN\username
+                var result = owner != null && string.Equals(owner.Value, currentUser, StringComparison.OrdinalIgnoreCase);
+
+                // DIAGNOSTIC: on some network shares (NAS/Samba, or under certain "default
+                // owner" GPOs) the NTFS owner metadata returned to a client doesn't reflect
+                // the real per-file creator — some fall back to reporting the querying user
+                // for every file, which would make this check always match regardless of who
+                // actually created the file. This line lets us confirm whether that's
+                // happening here before redesigning the ownership approach.
+                Logger.LogInfo($"IsOwnedByCurrentUser('{path}'): FileOwner='{owner?.Value ?? "<null>"}', CurrentUser='{currentUser}', Match={result}");
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                // Can't read the ACL (common on locked-down shares for non-owners) —
+                // treat as "not mine" rather than risk prompting for someone else's file.
+                Logger.LogError($"IsOwnedByCurrentUser('{path}'): ACL read failed — treating as not mine.",ex);
+                return false;
+            }
+        }
 
         private bool IsUnderExcludedFolder(string path)
         {
