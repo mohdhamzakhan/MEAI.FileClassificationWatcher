@@ -70,6 +70,7 @@ namespace MEAI.FileClassificationWatcher
                 };
                 watcher.Created += (_, e) => Task.Run(() => OnCreated(e.FullPath));
                 watcher.Changed += (_, e) => OnChanged(e.FullPath);
+                watcher.Deleted += (_, e) => Task.Run(() => OnDeletedAsync(e.FullPath));
                 watcher.Renamed += (_, e) =>
                 {
                     // Cancel any in-flight watch for the OLD path — it's about to point at a
@@ -163,7 +164,7 @@ namespace MEAI.FileClassificationWatcher
             {
                 // Can't read the ACL (common on locked-down shares for non-owners) —
                 // treat as "not mine" rather than risk prompting for someone else's file.
-                Logger.LogError($"IsOwnedByCurrentUser('{path}'): ACL read failed — treating as not mine.",ex);
+                Logger.LogInfo($"IsOwnedByCurrentUser('{path}'): ACL read failed ({ex.Message}) — treating as not mine.");
                 return false;
             }
         }
@@ -209,18 +210,6 @@ namespace MEAI.FileClassificationWatcher
 
                 if (OfficeDocumentClassifier.IsOfficeFormat(path))
                 {
-                    // Give Explorer's inline rename box time to finish before treating this
-                    // file as "released". A fresh Explorer "New > Office Document" leaves
-                    // the filename in an editable state for the user to type a real name,
-                    // and since nobody has the file locked yet, the release-check below
-                    // would otherwise fire almost instantly and pop the classification
-                    // prompt against the placeholder name (e.g. "New Word Document.docx")
-                    // before the rename ever lands on disk.
-                    await Task.Delay(TimeSpan.FromSeconds(4));
-                    if (!File.Exists(path)) return; // renamed away during the settle window
-                                                    // — the Renamed handler already queued
-                                                    // a fresh watch for the new name
-
                     // Office files can't be touched via COM automation while the app that
                     // just created them still has the file open — a brand-new .docx is
                     // open in the user's own Word window the instant it exists. Route
@@ -270,6 +259,75 @@ namespace MEAI.FileClassificationWatcher
             QueueCloseWatch(path);
         }
 
+        // The file is already gone by the time this fires, so we can't read anything off
+        // disk — we can only ask the API what the LAST KNOWN classification was for this
+        // path's GUID. That's also why this deliberately skips ShouldIgnore's extension
+        // whitelist/ownership checks except where they're still meaningful post-delete
+        // (exclusion folders, sidecar files): a Secret/TopSecret file being deleted is
+        // worth flagging regardless of who currently "owns" the now-nonexistent file.
+        private async Task OnDeletedAsync(string path)
+        {
+            try
+            {
+                if (ClassificationSidecar.IsSidecarFile(path)) return;
+                var ext = Path.GetExtension(path);
+                if (!_config.MonitoredExtensions.Contains(ext)) return;
+                if (IsUnderExcludedFolder(path)) return;
+
+                var documentGuid = ClassificationSidecar.DeterministicDocumentGuid(path);
+                var currentFromApi = await _api.GetLatestClassificationAsync(documentGuid);
+                var level = ClassificationLevelExtensions.Parse(currentFromApi);
+
+                if (level != ClassificationLevel.Secret && level != ClassificationLevel.TopSecret)
+                    return; // not classified, or classified below Secret — nothing to flag
+
+                Logger.LogInfo($"OnDeletedAsync: a {level} file was deleted: '{path}'.");
+
+                await _api.LogAsync(new ClassificationLogEntry
+                {
+                    Application = Path.GetExtension(path).ToLowerInvariant() switch
+                    {
+                        ".docx" or ".doc" => "Word",
+                        ".xlsx" or ".xls" => "Excel",
+                        ".pptx" or ".ppt" => "PowerPoint",
+                        _ => "File"
+                    },
+                    DocumentName = Path.GetFileName(path),
+                    DocumentPath = path,
+                    DocumentGuid = documentGuid,
+                    ActionType = "DeletedWhileClassified",
+                    Classification = level.Value.ToString(),
+                });
+
+                ShowDeletionAlert(path, level.Value);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"OnDeletedAsync failed for '{path}'", ex);
+            }
+        }
+
+        // A plain, informational, non-blocking alert — this is notifying someone that a
+        // sensitive file was removed, not asking them to make a decision, so unlike the
+        // classification prompt there's nothing to make mandatory and no reason to block
+        // the calling thread's caller any longer than the dialog needs to be shown.
+        private static void ShowDeletionAlert(string path, ClassificationLevel level)
+        {
+            var thread = new Thread(() =>
+            {
+                MessageBox.Show(
+                    $"A {level.ToDisplayName()} file was deleted:\n\n\"{path}\"\n\nDeleted by: {WindowsIdentity.GetCurrent().Name}\nTime: {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+                    "Classified File Deleted",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+            // Deliberately not joining here — this is a fire-and-forget notification, not
+            // a mandatory decision point like the classification prompt, so it shouldn't
+            // hold up OnDeletedAsync's caller (a Task.Run off the FileSystemWatcher thread).
+        }
+
         // Reset any existing watch for this file so multiple saves in a row only result
         // in one confirmation prompt, after things settle down. Shared by both OnCreated
         // (for Office formats) and OnChanged (everything).
@@ -290,6 +348,25 @@ namespace MEAI.FileClassificationWatcher
             var deadline = DateTime.Now.AddMinutes(_config.MaxWatchMinutes);
             try
             {
+                if (OfficeDocumentClassifier.IsOfficeFormat(path))
+                {
+                    // Give Explorer's inline rename box time to finish before the very first
+                    // release-check below. A fresh "New > Office Document" leaves the
+                    // filename editable for the user to type a real name, and Explorer often
+                    // also fires a Changed event (writing the template bytes) shortly after
+                    // Created — both routes land here via QueueCloseWatch, so the delay has
+                    // to live in this one shared method, not duplicated in each caller.
+                    // Since nobody has the file locked yet, IsFileReleased() would otherwise
+                    // return true almost instantly and pop the prompt against the placeholder
+                    // name before the rename ever lands on disk. Using the token here means a
+                    // rename during the wait (which cancels and requeues via QueueCloseWatch)
+                    // aborts this wait cleanly instead of running it out pointlessly.
+                    await Task.Delay(TimeSpan.FromSeconds(4), token);
+                    if (!File.Exists(path)) return; // renamed/deleted during the settle window
+                                                    // — whatever handler fired for its new
+                                                    // name (if any) already queued its own watch
+                }
+
                 while (!token.IsCancellationRequested && DateTime.Now < deadline)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(_config.LockPollIntervalSeconds), token);
@@ -364,7 +441,7 @@ namespace MEAI.FileClassificationWatcher
                     Path.GetFileName(path),
                     "Confirm the classification for this updated file.",
                     current,
-                    allowCancel: true);
+                    allowCancel: false);
                 if (form.ShowDialog() == DialogResult.OK)
                     selected = form.SelectedLevel;
             });
@@ -421,7 +498,7 @@ namespace MEAI.FileClassificationWatcher
             {
                 using var form = new ClassificationPromptForm(
                     Path.GetFileName(path), headline,
-                    currentLevel, allowCancel: !isNew); // mandatory only when genuinely unclassified
+                    currentLevel, allowCancel: false); // no Cancel option, ever — always mandatory
                 if (form.ShowDialog() == DialogResult.OK)
                     selected = form.SelectedLevel;
             });
@@ -429,10 +506,18 @@ namespace MEAI.FileClassificationWatcher
             thread.Start();
             thread.Join();
 
-            // isNew => allowCancel was false, so selected is always set by the form
-            // (defaults to Confidential internally); a null here only happens when the
-            // user backed out of a re-confirmation on an already-classified file.
-            if (selected == null) return;
+            // allowCancel is now always false — every prompt is mandatory, and
+            // ClassificationPromptForm blocks any force-close that isn't the Confirm
+            // button, so selected should always be set here. Kept as a fail-safe rather
+            // than an assumption: if a mandatory prompt ever still comes back null (e.g.
+            // the OS force-kills the dialog process), fall back to the file's existing
+            // classification if it had one, or Confidential for a genuinely new file —
+            // either way avoids silently leaving it unclassified or skipping the write.
+            if (selected == null)
+            {
+                selected = currentLevel ?? ClassificationLevel.Confidential;
+                Logger.LogInfo($"HandleOfficeFileClosedAsync: mandatory prompt for '{path}' closed without a selection — defaulting to {selected}.");
+            }
 
             var newLevel = selected.Value;
             var levelChanged = newLevel.ToString() != currentFromApi;
@@ -449,8 +534,16 @@ namespace MEAI.FileClassificationWatcher
 
             if (needsSecretLevel && !fileAlreadyPassworded)
             {
-                passwordAction = PromptForPassword(path, newLevel, allowCancel: !isNew);
-                if (passwordAction == null) return;
+                passwordAction = PromptForPassword(path, newLevel, allowCancel: false); // no Cancel, ever
+                if (passwordAction == null)
+                {
+                    // Should be unreachable now that the dialog can't be force-closed
+                    // without a valid password, but keep a safe fallback rather than
+                    // silently abandoning the whole classification if it somehow happens.
+                    Logger.LogError($"HandleOfficeFileClosedAsync: mandatory password prompt for '{path}' returned null unexpectedly.",
+                        new Exception("PromptForPassword returned null despite allowCancel: false."));
+                    return;
+                }
                 PasswordStore.Save(documentGuid, passwordAction);
             }
             else if (!needsSecretLevel && fileAlreadyPassworded)
@@ -469,8 +562,9 @@ namespace MEAI.FileClassificationWatcher
 
                 if (!applied)
                 {
-                    Logger.LogError($"HandleOfficeFileClosedAsync: failed to apply classification to '{path}'",
+                    Logger.LogError($"HandleOfficeFileClosedAsync: failed to apply classification to '{path}' — NOT logging this as a success to the API, so the next close will re-prompt (mandatory, if it was still unclassified) instead of silently treating it as done.",
                         new Exception("OfficeDocumentClassifier.Apply returned false — see prior log entry for the underlying exception."));
+                    return; // do not record a classification that was never actually written
                 }
 
                 await _api.LogAsync(new ClassificationLogEntry

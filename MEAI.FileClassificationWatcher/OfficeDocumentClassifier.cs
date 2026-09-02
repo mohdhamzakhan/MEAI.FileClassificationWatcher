@@ -59,12 +59,13 @@ namespace MEAI.FileClassificationWatcher
 
                 WriteCustomProperty(doc.CustomDocumentProperties, level.ToString());
                 WriteCategory(doc.BuiltInDocumentProperties, level);
-                WriteWordHeader(doc, level);
                 ApplyPassword(passwordAction, v => doc.Password = v);
+                WriteWordHeader(doc, path, level);
 
-                doc.Saved = false;
+                LogReadBack(path, doc.BuiltInDocumentProperties, doc.CustomDocumentProperties);
 
                 SaveWithRetry(path, doc.Save, () => doc.ProtectionType.ToString());
+                Logger.LogInfo($"ApplyToWord: Save() returned without exception for '{path}'.");
                 return true;
             }
             catch (Exception ex)
@@ -95,10 +96,9 @@ namespace MEAI.FileClassificationWatcher
                 WriteCustomProperty(wb.CustomDocumentProperties, level.ToString());
                 dynamic excelWb = wb;
                 WriteCategory(excelWb.BuiltInDocumentProperties, level);
-                WriteExcelHeader(wb, level);
                 ApplyPassword(passwordAction, () => wb.Password, v => wb.Password = v);
 
-                wb.Saved = false;
+                WriteExcelHeader(wb, path, level);
 
                 SaveWithRetry(path, wb.Save, () => "n/a");
                 return true;
@@ -136,10 +136,7 @@ namespace MEAI.FileClassificationWatcher
 
                 WriteCustomProperty(pres.CustomDocumentProperties, level.ToString());
                 WriteCategory(pres.BuiltInDocumentProperties, level);
-                WritePowerPointHeader(pres, level);
                 ApplyPassword(passwordAction, () => pres.Password, v => pres.Password = v);
-
-                pres.Saved = Microsoft.Office.Core.MsoTriState.msoFalse;
 
                 SaveWithRetry(path, pres.Save, () => "n/a");
                 return true;
@@ -152,6 +149,106 @@ namespace MEAI.FileClassificationWatcher
             finally
             {
                 CloseAndQuit(pres, p => p.Close(), app, a => a.Quit());
+            }
+        }
+
+        // Reads back the two properties immediately after setting them (before Save) and
+        // logs the actual values the app believes it just wrote. If a later raw-XML
+        // inspection of the saved file shows these values missing, this line tells us
+        // whether the bug is "never set in memory" (this log would show blank/error too)
+        // vs. "set in memory but didn't survive Save()" (this log shows the right values,
+        // but the file on disk doesn't) — two very different bugs.
+        private static void LogReadBack(string path, object builtInPropsObj, object customPropsObj)
+        {
+            string category = "<read failed>", custom = "<read failed>";
+            try
+            {
+                dynamic props = builtInPropsObj;
+                category = props["Category"].Value?.ToString() ?? "<null>";
+            }
+            catch (Exception ex) { category = $"<exception: {ex.Message}>"; }
+
+            try
+            {
+                dynamic props = customPropsObj;
+                custom = props["MEAI_Classification"].Value?.ToString() ?? "<null>";
+            }
+            catch (Exception ex) { custom = $"<exception: {ex.Message}>"; }
+
+            Logger.LogInfo($"LogReadBack for '{path}': Category='{category}', MEAI_Classification='{custom}' (read back immediately before Save()).");
+        }
+
+        // Excel's PageSetup header/footer accept a small formatting-code language:
+        // &"FontName,Style" sets font, &<size> sets size, &K<RRGGBB> sets font color,
+        // &C starts the centered section. This shows up both on-screen (in Page Layout
+        // view) and on any printout, which is the closest thing to a visible "stamp" this
+        // Interop API offers without drawing shapes on every sheet.
+        //
+        // Chart sheets and some protected/very old .xls sheets can throw when PageSetup is
+        // touched, so each sheet is wrapped individually — one sheet failing shouldn't stop
+        // the header from being applied to the rest of the workbook, and shouldn't fail the
+        // whole classification (the Category/custom properties above already succeeded).
+        private static void WriteExcelHeader(Microsoft.Office.Interop.Excel.Workbook wb, string path, ClassificationLevel level)
+        {
+            var colorHex = level switch
+            {
+                ClassificationLevel.TopSecret => "C00000",   // dark red
+                ClassificationLevel.Secret => "ED7D31",      // orange
+                ClassificationLevel.Confidential => "2E75B6",// blue
+                ClassificationLevel.Public => "548235",      // green
+                _ => "000000",
+            };
+            var bannerText = $"Classification {level.ToDisplayName().ToUpperInvariant()}";
+            var headerCode = $"&\"IBM Plex Sans,Bold\"&10&K{colorHex}{bannerText}";
+
+            foreach (Microsoft.Office.Interop.Excel.Worksheet ws in wb.Worksheets)
+            {
+                try
+                {
+                    ws.PageSetup.CenterHeader = headerCode;
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"WriteExcelHeader failed for sheet '{ws.Name}' in '{path}'", ex);
+                }
+            }
+        }
+
+        // Same visible-marking approach as WriteExcelHeader: a bold, color-coded banner,
+        // this time in Word's header object model. A document can have multiple Sections,
+        // each with its own header unless explicitly linked to the previous one — looping
+        // over all of them (and unlinking first) ensures the banner shows on every page
+        // even in documents with section breaks, rather than just the first page.
+        private static void WriteWordHeader(Microsoft.Office.Interop.Word.Document doc, string path, ClassificationLevel level)
+        {
+            var color = level switch
+            {
+                ClassificationLevel.TopSecret => Microsoft.Office.Interop.Word.WdColor.wdColorDarkRed,
+                ClassificationLevel.Secret => Microsoft.Office.Interop.Word.WdColor.wdColorOrange,
+                ClassificationLevel.Confidential => Microsoft.Office.Interop.Word.WdColor.wdColorBlue,
+                ClassificationLevel.Public => Microsoft.Office.Interop.Word.WdColor.wdColorGreen,
+                _ => Microsoft.Office.Interop.Word.WdColor.wdColorBlack,
+            };
+            var bannerText = $"Classification {level.ToDisplayName().ToUpperInvariant()}";
+
+            foreach (Microsoft.Office.Interop.Word.Section section in doc.Sections)
+            {
+                try
+                {
+                    var header = section.Headers[Microsoft.Office.Interop.Word.WdHeaderFooterIndex.wdHeaderFooterPrimary];
+                    header.LinkToPrevious = false; // otherwise later sections silently no-op here
+                    var range = header.Range;
+                    range.Text = bannerText;
+                    range.Font.Bold = 1;
+                    range.Font.Size = 10;
+                    range.Font.Name = "IBM Plex Sans";
+                    range.Font.Color = color;
+                    range.ParagraphFormat.Alignment = Microsoft.Office.Interop.Word.WdParagraphAlignment.wdAlignParagraphRight;
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"WriteWordHeader failed for a section in '{path}'", ex);
+                }
             }
         }
 
@@ -293,85 +390,6 @@ namespace MEAI.FileClassificationWatcher
 
             GC.Collect();
             GC.WaitForPendingFinalizers();
-        }
-
-        private static void WriteWordHeader(Microsoft.Office.Interop.Word.Document doc, ClassificationLevel level)
-        {
-            try
-            {
-                foreach (Microsoft.Office.Interop.Word.Section section in doc.Sections)
-                {
-                    var header = section.Headers[Microsoft.Office.Interop.Word.WdHeaderFooterIndex.wdHeaderFooterPrimary];
-                    header.Range.Text = $"Classification: {level.ToDisplayName()}";
-                    header.Range.ParagraphFormat.Alignment = Microsoft.Office.Interop.Word.WdParagraphAlignment.wdAlignParagraphRight;
-                    header.Range.Font.Bold = 1;
-                    header.Range.Font.Size = 10;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError("WriteWordHeader failed to set header text", ex);
-            }
-        }
-
-        private static void WriteExcelHeader(Microsoft.Office.Interop.Excel.Workbook wb, ClassificationLevel level)
-        {
-            try
-            {
-                string headerText = $"&B&U&10Classification: {level.ToDisplayName()}"; // &B = Bold, &10 = 10pt font
-
-                foreach (Microsoft.Office.Interop.Excel.Worksheet sheet in wb.Worksheets)
-                {
-                    sheet.PageSetup.CenterHeader = headerText;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError("WriteExcelHeader failed to set header text", ex);
-            }
-        }
-
-        private static void WritePowerPointHeader(Microsoft.Office.Interop.PowerPoint.Presentation pres, ClassificationLevel level)
-        {
-            const string bannerName = "MEAI_ClassificationHeader";
-            string text = $"Classification: {level.ToDisplayName()}";
-
-            try
-            {
-                // Iterate through all design slide masters in the presentation
-                for (int d = 1; d <= pres.Designs.Count; d++)
-                {
-                    var master = pres.Designs[d].SlideMaster;
-
-                    // Remove any previously applied classification banner
-                    for (int s = master.Shapes.Count; s >= 1; s--)
-                    {
-                        if (master.Shapes[s].Name == bannerName)
-                        {
-                            master.Shapes[s].Delete();
-                        }
-                    }
-
-                    // Create a full-width header banner at the top (Y = 0)
-                    float slideWidth = pres.PageSetup.SlideWidth;
-                    var banner = master.Shapes.AddTextbox(
-                        Microsoft.Office.Core.MsoTextOrientation.msoTextOrientationHorizontal,
-                        Left: 0,
-                        Top: 0,
-                        Width: slideWidth,
-                        Height: 18);
-
-                    banner.Name = bannerName;
-                    banner.TextFrame.TextRange.Text = text;
-                    banner.TextFrame.TextRange.ParagraphFormat.Alignment = Microsoft.Office.Interop.PowerPoint.PpParagraphAlignment.ppAlignCenter;
-                    banner.TextFrame.TextRange.Font.Size = 10;
-                    banner.TextFrame.TextRange.Font.Bold = Microsoft.Office.Core.MsoTriState.msoTrue;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError("WritePowerPointHeader failed to set master banner", ex);
-            }
         }
     }
 }

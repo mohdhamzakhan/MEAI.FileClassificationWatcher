@@ -86,6 +86,16 @@ namespace MEAI.FileClassificationWatcher
 
             AcceptButton = _btnOk;
             if (allowCancel) CancelButton = _btnCancel;
+
+            // ControlBox = false removes the X button, but doesn't reliably stop every way
+            // of force-closing a window (Alt+F4, right-click the taskbar entry > Close).
+            // When this prompt is meant to be mandatory (no Cancel), block any close that
+            // didn't come from clicking Confirm, so SelectedLevel can never end up null here.
+            FormClosing += (_, e) =>
+            {
+                if (!allowCancel && DialogResult != DialogResult.OK)
+                    e.Cancel = true;
+            };
         }
     }
 }

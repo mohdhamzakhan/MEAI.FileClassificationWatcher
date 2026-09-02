@@ -72,6 +72,16 @@ namespace MEAI.FileClassificationWatcher
 
             AcceptButton = _btnOk;
             if (allowCancel) CancelButton = _btnCancel;
+
+            // Same reasoning as ClassificationPromptForm: ControlBox = false removes the X
+            // button, but doesn't stop Alt+F4 or a taskbar "Close" from force-closing the
+            // window. When mandatory, block any close that didn't come from Validate()
+            // succeeding, so EnteredPassword can't end up null here either.
+            FormClosing += (_, e) =>
+            {
+                if (!allowCancel && DialogResult != DialogResult.OK)
+                    e.Cancel = true;
+            };
         }
 
         private void Validate()
