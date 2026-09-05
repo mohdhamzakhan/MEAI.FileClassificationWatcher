@@ -16,12 +16,27 @@ namespace MEAI.FileClassificationWatcher
         private readonly RadioButton _rbPublic = new() { Text = "Public", AutoSize = true };
         private readonly Button _btnOk = new() { Text = "Confirm", DialogResult = DialogResult.OK, AutoSize = true };
         private readonly Button _btnCancel;
+        private volatile bool _superseded;
 
         public ClassificationLevel? SelectedLevel { get; private set; }
+
+        // Lets the service force-close this dialog when a newer event (typically: the file
+        // got renamed while this prompt was still open) makes it stale. Safe to call from
+        // any thread — WinForms controls can only be touched from their own UI thread, so
+        // this marshals via Invoke rather than calling Close() directly.
+        public void Supersede()
+        {
+            _superseded = true;
+            if (IsHandleCreated)
+            {
+                try { Invoke(new Action(Close)); } catch (ObjectDisposedException) { /* already closing */ }
+            }
+        }
 
         public ClassificationPromptForm(string documentName, string headline, ClassificationLevel? current = null, bool allowCancel = true)
         {
             Text = "Document Classification";
+            Icon = BrandIcon.Create();
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterScreen;
             MinimizeBox = false;
@@ -90,10 +105,12 @@ namespace MEAI.FileClassificationWatcher
             // ControlBox = false removes the X button, but doesn't reliably stop every way
             // of force-closing a window (Alt+F4, right-click the taskbar entry > Close).
             // When this prompt is meant to be mandatory (no Cancel), block any close that
-            // didn't come from clicking Confirm, so SelectedLevel can never end up null here.
+            // didn't come from clicking Confirm — with one deliberate exception:
+            // Supersede() (the file was renamed/changed again while this was still open)
+            // sets _superseded first specifically so this same guard doesn't block it.
             FormClosing += (_, e) =>
             {
-                if (!allowCancel && DialogResult != DialogResult.OK)
+                if (!allowCancel && DialogResult != DialogResult.OK && !_superseded)
                     e.Cancel = true;
             };
         }

@@ -21,6 +21,7 @@ namespace MEAI.FileClassificationWatcher
         public PasswordEntryForm(string documentName, string levelDisplayName, bool allowCancel)
         {
             Text = "Set Document Password";
+            Icon = BrandIcon.Create();
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterScreen;
             MinimizeBox = false;

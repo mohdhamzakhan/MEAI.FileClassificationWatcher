@@ -1,10 +1,10 @@
-using System.Text.Json;
+ï»¿using System.Text.Json;
 using System.Windows.Forms;
 
 namespace MEAI.FileClassificationWatcher
 {
     // Runs as a normal user-mode app (Startup folder or a per-user Scheduled Task set to
-    // "Run only when user is logged on") — NOT as a service, so it can show UI. Sits in the
+    // "Run only when user is logged on") ï¿½ NOT as a service, so it can show UI. Sits in the
     // system tray with no visible window; SystemMonitorWorker keeps doing its own thing
     // unrelated to this.
     internal static class Program
@@ -28,7 +28,7 @@ namespace MEAI.FileClassificationWatcher
             _service.Start();
 
             // Central settings changes (an admin updates the DB row) reach this machine
-            // on the next poll and take effect immediately — no restart, no per-machine edit.
+            // on the next poll and take effect immediately ï¿½ no restart, no per-machine edit.
             settingsSync.SettingsChanged += config => _service.Reconfigure(config);
             _ = settingsSync.RunPollingLoopAsync(_pollCts.Token);
 
@@ -39,7 +39,7 @@ namespace MEAI.FileClassificationWatcher
             // exit for the end user.
             using var trayIcon = new NotifyIcon
             {
-                Icon = SystemIcons.Shield,
+                Icon = BrandIcon.Create(),
                 Visible = true,
                 Text = "MEAI Document Classification"
             };
