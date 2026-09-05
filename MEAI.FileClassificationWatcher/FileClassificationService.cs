@@ -38,6 +38,11 @@ namespace MEAI.FileClassificationWatcher
         private static readonly TimeSpan SelfWriteSuppressWindow = TimeSpan.FromSeconds(38);
         private readonly ConcurrentDictionary<string, byte> _inFlight =
                         new(StringComparer.OrdinalIgnoreCase);
+        // Tracks whichever ClassificationPromptForm is currently open for a given path, so
+        // a Renamed event for that same path can force-close ("supersede") a stale prompt
+        // instead of leaving it open alongside a fresh one for the new name.
+        private readonly ConcurrentDictionary<string, ClassificationPromptForm> _activePrompts =
+                        new(StringComparer.OrdinalIgnoreCase);
         public FileClassificationService(WatcherConfig config)
         {
             _config = config;
@@ -81,6 +86,11 @@ namespace MEAI.FileClassificationWatcher
                     // catches up to a file that's already been renamed away.
                     if (_pendingCloseWatches.TryRemove(e.OldFullPath, out var staleCts))
                         staleCts.Cancel();
+                    // If a prompt is already open for the old name (mid-classification when
+                    // the rename landed), force-close it instead of leaving it sitting there
+                    // alongside a fresh prompt that's about to start for the new name.
+                    if (_activePrompts.TryRemove(e.OldFullPath, out var staleForm))
+                        staleForm.Supersede(); // safe from any thread — marshals internally
                     OnChanged(e.FullPath);
                 };
                 _watchers.Add(watcher);
@@ -411,63 +421,89 @@ namespace MEAI.FileClassificationWatcher
 
         private async Task HandlePossibleCloseAsync(string path)
         {
-            var sidecar = ClassificationSidecar.Load(path) ?? new ClassificationSidecar();
-            var documentGuid = ClassificationSidecar.DeterministicDocumentGuid(path);
-            var newHash = TryHash(path);
-
-            // Nothing actually changed since we last confirmed (e.g. app just touched
-            // the file's timestamp) — don't bother the user. Only applies when we have a
-            // sidecar from earlier in this same session; if it was deleted after a prior
-            // close, we fall through and always confirm on the first Changed event of a
-            // fresh edit session.
-            if (newHash == sidecar.LastContentHash && !string.IsNullOrEmpty(sidecar.Classification))
-                return;
-
-            // The sidecar is just a same-session cache — the authoritative "current
-            // classification" comes from the API/DB, looked up by the file's deterministic
-            // GUID. This matters once the sidecar has been deleted after a previous close:
-            // without this, a fresh edit session would have no idea what the file was last
-            // classified as. If the API can't be reached, default to Confidential rather
-            // than leaving it unclassified or blocking on retries.
-            var currentFromApi = await _api.GetLatestClassificationAsync(documentGuid);
-            var current = ClassificationLevelExtensions.Parse(currentFromApi)
-                          ?? ClassificationLevelExtensions.Parse(sidecar.Classification)
-                          ?? ClassificationLevel.Confidential;
-
-            ClassificationLevel? selected = null;
-            var thread = new Thread(() =>
+            // Marked BEFORE the dialog is shown, not after it returns — a second Changed
+            // event for this exact path while the dialog is still open (e.g. two quick
+            // saves) would otherwise sail straight through ShouldIgnore/QueueCloseWatch's
+            // _inFlight check and spawn a second, fully independent popup for the same
+            // file. Removed in `finally` so it covers the dialog AND everything after it.
+            if (!_inFlight.TryAdd(path, 0)) return;
+            try
             {
-                using var form = new ClassificationPromptForm(
-                    Path.GetFileName(path),
-                    "Confirm the classification for this updated file.",
-                    current,
-                    allowCancel: false);
-                if (form.ShowDialog() == DialogResult.OK)
-                    selected = form.SelectedLevel;
-            });
-            thread.SetApartmentState(ApartmentState.STA);
-            thread.Start();
-            thread.Join();
+                var sidecar = ClassificationSidecar.Load(path) ?? new ClassificationSidecar();
+                var documentGuid = ClassificationSidecar.DeterministicDocumentGuid(path);
+                var newHash = TryHash(path);
 
-            if (selected == null) return; // user dismissed — leave classification as-is, don't log a change
+                // Nothing actually changed since we last confirmed (e.g. app just touched
+                // the file's timestamp) — don't bother the user. Only applies when we have a
+                // sidecar from earlier in this same session; if it was deleted after a prior
+                // close, we fall through and always confirm on the first Changed event of a
+                // fresh edit session.
+                if (newHash == sidecar.LastContentHash && !string.IsNullOrEmpty(sidecar.Classification))
+                    return;
 
-            var previous = current.ToString();
+                // The sidecar is just a same-session cache — the authoritative "current
+                // classification" comes from the API/DB, looked up by the file's deterministic
+                // GUID. This matters once the sidecar has been deleted after a previous close:
+                // without this, a fresh edit session would have no idea what the file was last
+                // classified as. If the API can't be reached, default to Confidential rather
+                // than leaving it unclassified or blocking on retries.
+                var currentFromApi = await _api.GetLatestClassificationAsync(documentGuid);
+                var current = ClassificationLevelExtensions.Parse(currentFromApi)
+                              ?? ClassificationLevelExtensions.Parse(sidecar.Classification)
+                              ?? ClassificationLevel.Confidential;
 
-            await _api.LogAsync(new ClassificationLogEntry
+                ClassificationLevel? selected = null;
+                var thread = new Thread(() =>
+                {
+                    using var form = new ClassificationPromptForm(
+                        Path.GetFileName(path),
+                        "Confirm the classification for this updated file.",
+                        current,
+                        allowCancel: false);
+                    _activePrompts[path] = form;
+                    if (form.ShowDialog() == DialogResult.OK)
+                        selected = form.SelectedLevel;
+                });
+                thread.SetApartmentState(ApartmentState.STA);
+                thread.Start();
+                thread.Join();
+                _activePrompts.TryRemove(path, out _);
+
+                if (selected == null)
+                {
+                    // Reachable now via Supersede() (renamed mid-classification — the old
+                    // path is gone, so its sidecar is stale) or, extremely rarely, an OS
+                    // force-kill of the dialog process. Either way, clean up the sidecar for
+                    // THIS path rather than leaving an orphaned .json sidecar behind — a
+                    // fresh cycle for a renamed file's new name creates its own sidecar, and
+                    // deleting one that's already gone is a harmless no-op.
+                    ClassificationSidecar.Delete(path);
+                    return;
+                }
+
+                var previous = current.ToString();
+
+                await _api.LogAsync(new ClassificationLogEntry
+                {
+                    Application = "File",
+                    DocumentName = Path.GetFileName(path),
+                    DocumentPath = path,
+                    DocumentGuid = documentGuid,
+                    ActionType = selected.Value.ToString() == previous ? "ConfirmedOnClose" : "ChangedOnClose",
+                    PreviousClassification = previous,
+                    Classification = selected.Value.ToString()
+                });
+
+                // The file is closed and its classification is confirmed/logged to the DB —
+                // the sidecar's only job (avoiding re-prompts mid-edit) is done, so clean it up
+                // rather than leaving a hidden file behind once the user is finished with it.
+                ClassificationSidecar.Delete(path);
+            }
+            finally
             {
-                Application = "File",
-                DocumentName = Path.GetFileName(path),
-                DocumentPath = path,
-                DocumentGuid = documentGuid,
-                ActionType = selected.Value.ToString() == previous ? "ConfirmedOnClose" : "ChangedOnClose",
-                PreviousClassification = previous,
-                Classification = selected.Value.ToString()
-            });
-
-            // The file is closed and its classification is confirmed/logged to the DB —
-            // the sidecar's only job (avoiding re-prompts mid-edit) is done, so clean it up
-            // rather than leaving a hidden file behind once the user is finished with it.
-            ClassificationSidecar.Delete(path);
+                _activePrompts.TryRemove(path, out _); // no-op if already removed above
+                _inFlight.TryRemove(path, out _);
+            }
         }
 
         // Runs once a Word/Excel/PowerPoint file has been released (closed, or saved-and-
@@ -483,80 +519,97 @@ namespace MEAI.FileClassificationWatcher
                                             // the correct cycle for its new name (if any)
                                             // is already queued separately
 
-            var documentGuid = ClassificationSidecar.DeterministicDocumentGuid(path);
-            var currentFromApi = await _api.GetLatestClassificationAsync(documentGuid);
-            var currentLevel = ClassificationLevelExtensions.Parse(currentFromApi);
-            var isNew = currentLevel == null;
-
-
-            var headline = isNew
-                ? "This file has no classification yet.\nSelect a classification level:"
-                : "Confirm the classification for this updated file.";
-
-            ClassificationLevel? selected = null;
-            var thread = new Thread(() =>
-            {
-                using var form = new ClassificationPromptForm(
-                    Path.GetFileName(path), headline,
-                    currentLevel, allowCancel: false); // no Cancel option, ever — always mandatory
-                if (form.ShowDialog() == DialogResult.OK)
-                    selected = form.SelectedLevel;
-            });
-            thread.SetApartmentState(ApartmentState.STA);
-            thread.Start();
-            thread.Join();
-
-            // allowCancel is now always false — every prompt is mandatory, and
-            // ClassificationPromptForm blocks any force-close that isn't the Confirm
-            // button, so selected should always be set here. Kept as a fail-safe rather
-            // than an assumption: if a mandatory prompt ever still comes back null (e.g.
-            // the OS force-kills the dialog process), fall back to the file's existing
-            // classification if it had one, or Confidential for a genuinely new file —
-            // either way avoids silently leaving it unclassified or skipping the write.
-            if (selected == null)
-            {
-                selected = currentLevel ?? ClassificationLevel.Confidential;
-                Logger.LogInfo($"HandleOfficeFileClosedAsync: mandatory prompt for '{path}' closed without a selection — defaulting to {selected}.");
-            }
-
-            var newLevel = selected.Value;
-            var levelChanged = newLevel.ToString() != currentFromApi;
-
-            // Tri-state password action — see OfficeDocumentClassifier for the convention.
-            // Only ask the user to type a password when the level is NEWLY entering
-            // Secret/TopSecret; staying at the same Secret/TopSecret level leaves whatever
-            // password is already embedded in the file untouched (we never asked the user
-            // to retype a password they already set moments/days ago).
-            var knownPassword = PasswordStore.TryGet(documentGuid);
-            bool fileAlreadyPassworded = knownPassword != null;
-            string? passwordAction = null;
-            bool needsSecretLevel = newLevel == ClassificationLevel.Secret || newLevel == ClassificationLevel.TopSecret;
-
-            if (needsSecretLevel && !fileAlreadyPassworded)
-            {
-                passwordAction = PromptForPassword(path, newLevel, allowCancel: false); // no Cancel, ever
-                if (passwordAction == null)
-                {
-                    // Should be unreachable now that the dialog can't be force-closed
-                    // without a valid password, but keep a safe fallback rather than
-                    // silently abandoning the whole classification if it somehow happens.
-                    Logger.LogError($"HandleOfficeFileClosedAsync: mandatory password prompt for '{path}' returned null unexpectedly.",
-                        new Exception("PromptForPassword returned null despite allowCancel: false."));
-                    return;
-                }
-                PasswordStore.Save(documentGuid, passwordAction);
-            }
-            else if (!needsSecretLevel && fileAlreadyPassworded)
-            {
-                passwordAction = string.Empty; // downgrading below Secret — clear it
-                PasswordStore.Delete(documentGuid);
-            }
-
+            // Marked BEFORE either dialog is shown, not after both return — a second
+            // release-detection for this exact path while a prompt is still open (two
+            // quick saves, or a large file emitting several Changed events as it flushes)
+            // would otherwise sail straight through ShouldIgnore/QueueCloseWatch's
+            // _inFlight check and spawn a second, fully independent popup for the same
+            // file. Wrapping the whole method — both dialogs plus Apply/LogAsync — in one
+            // try/finally is what makes that guard actually cover the window where it matters.
             if (!_inFlight.TryAdd(path, 0))
                 return; // another cycle for this exact path is already running — let it finish
-
             try
             {
+                var documentGuid = ClassificationSidecar.DeterministicDocumentGuid(path);
+                var currentFromApi = await _api.GetLatestClassificationAsync(documentGuid);
+                var currentLevel = ClassificationLevelExtensions.Parse(currentFromApi);
+                var isNew = currentLevel == null;
+
+                var headline = isNew
+                    ? "This file has no classification yet.\nSelect a classification level:"
+                    : "Confirm the classification for this updated file.";
+
+                ClassificationLevel? selected = null;
+                var thread = new Thread(() =>
+                {
+                    using var form = new ClassificationPromptForm(
+                        Path.GetFileName(path), headline,
+                        currentLevel, allowCancel: false); // no Cancel option, ever — always mandatory
+                    _activePrompts[path] = form;
+                    if (form.ShowDialog() == DialogResult.OK)
+                        selected = form.SelectedLevel;
+                });
+                thread.SetApartmentState(ApartmentState.STA);
+                thread.Start();
+                thread.Join();
+                _activePrompts.TryRemove(path, out _);
+
+                // allowCancel is now always false — every prompt is mandatory, and
+                // ClassificationPromptForm blocks any force-close that isn't the Confirm
+                // button or a deliberate Supersede() (renamed mid-classification), so
+                // selected should always be set here except in that supersede case. Kept
+                // as a fail-safe rather than an assumption: if a mandatory prompt ever
+                // still comes back null, fall back to the file's existing classification
+                // if it had one, or Confidential for a genuinely new file — either way
+                // avoids silently leaving it unclassified or skipping the write.
+                if (selected == null)
+                {
+                    if (!File.Exists(path))
+                    {
+                        // Superseded by a rename — this path is gone, there's nothing left
+                        // to classify here, and a fresh cycle already started for whatever
+                        // the file is now called. Just stop, don't apply a fallback level
+                        // to a file that no longer exists at this path.
+                        Logger.LogInfo($"HandleOfficeFileClosedAsync: prompt for '{path}' was superseded (file renamed/removed) — skipping.");
+                        return;
+                    }
+                    selected = currentLevel ?? ClassificationLevel.Confidential;
+                    Logger.LogInfo($"HandleOfficeFileClosedAsync: mandatory prompt for '{path}' closed without a selection — defaulting to {selected}.");
+                }
+
+                var newLevel = selected.Value;
+                var levelChanged = newLevel.ToString() != currentFromApi;
+
+                // Tri-state password action — see OfficeDocumentClassifier for the convention.
+                // Only ask the user to type a password when the level is NEWLY entering
+                // Secret/TopSecret; staying at the same Secret/TopSecret level leaves whatever
+                // password is already embedded in the file untouched (we never asked the user
+                // to retype a password they already set moments/days ago).
+                var knownPassword = PasswordStore.TryGet(documentGuid);
+                bool fileAlreadyPassworded = knownPassword != null;
+                string? passwordAction = null;
+                bool needsSecretLevel = newLevel == ClassificationLevel.Secret || newLevel == ClassificationLevel.TopSecret;
+
+                if (needsSecretLevel && !fileAlreadyPassworded)
+                {
+                    passwordAction = PromptForPassword(path, newLevel, allowCancel: false); // no Cancel, ever
+                    if (passwordAction == null)
+                    {
+                        // Should be unreachable now that the dialog can't be force-closed
+                        // without a valid password, but keep a safe fallback rather than
+                        // silently abandoning the whole classification if it somehow happens.
+                        Logger.LogError($"HandleOfficeFileClosedAsync: mandatory password prompt for '{path}' returned null unexpectedly.",
+                            new Exception("PromptForPassword returned null despite allowCancel: false."));
+                        return;
+                    }
+                    PasswordStore.Save(documentGuid, passwordAction);
+                }
+                else if (!needsSecretLevel && fileAlreadyPassworded)
+                {
+                    passwordAction = string.Empty; // downgrading below Secret — clear it
+                    PasswordStore.Delete(documentGuid);
+                }
+
                 _selfAppliedUtc[path] = DateTime.UtcNow; // mark BEFORE Apply's save can fire its echo
                 var applied = OfficeDocumentClassifier.Apply(path, newLevel, passwordAction, knownPassword);
 
@@ -587,6 +640,7 @@ namespace MEAI.FileClassificationWatcher
             }
             finally
             {
+                _activePrompts.TryRemove(path, out _); // no-op if already removed above
                 _inFlight.TryRemove(path, out _);
             }
         }

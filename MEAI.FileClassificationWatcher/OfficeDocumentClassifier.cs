@@ -133,13 +133,27 @@ namespace MEAI.FileClassificationWatcher
                 // WithWindow=msoFalse below is what actually keeps the presentation window
                 // from appearing; Application.Visible is left at its default rather than
                 // relying on a property that isn't consistently honored.
-                app = new Microsoft.Office.Interop.PowerPoint.Application();
+                //
+                // DisplayAlerts matters more here than it did for Word/Excel: if PowerPoint
+                // suspects a file needs repairing (which can happen on a freshly-created or
+                // still-settling file — the same timing sensitivity behind the read-only
+                // bug above), its default is to prompt "PowerPoint found a problem... would
+                // you like to repair it?". With no visible window, there's nothing for a
+                // person to answer, and PowerPoint's repair path is known to strip content
+                // it can't cleanly parse — including images — before resaving. Suppressing
+                // alerts here (Word/Excel already do this) avoids that path being triggered
+                // at all during automation.
+                app = new Microsoft.Office.Interop.PowerPoint.Application
+                {
+                    DisplayAlerts = Microsoft.Office.Interop.PowerPoint.PpAlertLevel.ppAlertsNone,
+                    AutomationSecurity = Microsoft.Office.Core.MsoAutomationSecurity.msoAutomationSecurityLow
+                };
                 pres = OpenWithRetry(() => app.Presentations.Open(path, ReadOnly: Microsoft.Office.Core.MsoTriState.msoFalse,
                     Untitled: Microsoft.Office.Core.MsoTriState.msoFalse, WithWindow: Microsoft.Office.Core.MsoTriState.msoFalse));
                 if (pres == null) return false;
 
                 WriteCustomProperty(pres.CustomDocumentProperties, level.ToString());
-                WriteCategory(pres.BuiltInDocumentProperties, level);
+                TryWriteCategorySafely(() => pres.BuiltInDocumentProperties, level, path);
                 ApplyPassword(passwordAction, () => pres.Password, v => pres.Password = v);
 
                 SaveWithRetry(path, pres.Save, () => "n/a");
@@ -726,6 +740,28 @@ namespace MEAI.FileClassificationWatcher
                 return;
 
             setPassword(passwordAction);
+        }
+
+        // WriteCategory(pres.BuiltInDocumentProperties, level) evaluates the getter as a
+        // method ARGUMENT before WriteCategory's own try/catch ever runs — if the getter
+        // itself throws (e.g. the underlying COM object has become invalid mid-operation,
+        // as seen on a large PowerPoint file where automation appears to destabilize),
+        // that exception bypasses WriteCategory's protection entirely and takes down the
+        // whole Apply() call. This wraps the getter evaluation in its own try/catch so
+        // that specific failure mode is caught and logged here instead.
+        private static void TryWriteCategorySafely(Func<object> getBuiltInProps, ClassificationLevel level, string path)
+        {
+            object props;
+            try
+            {
+                props = getBuiltInProps();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"TryWriteCategorySafely: BuiltInDocumentProperties getter itself failed for '{path}' — the underlying COM object is likely no longer valid.", ex);
+                return;
+            }
+            WriteCategory(props, level);
         }
 
         private static void WriteCategory(object builtInPropsObj, ClassificationLevel level)
