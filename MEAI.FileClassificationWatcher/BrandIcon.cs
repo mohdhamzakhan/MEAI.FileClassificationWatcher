@@ -27,6 +27,27 @@ namespace MEAI.FileClassificationWatcher
         {
             if (_cached != null) return _cached;
 
+            // Now that Resources/AppIcon.ico is embedded into the exe itself via
+            // <ApplicationIcon> in the .csproj, pull the icon straight from the running
+            // executable rather than redrawing it — this is what Explorer, the taskbar, and
+            // any installer's "DisplayIcon" all already see, so using the same source here
+            // guarantees the tray icon and every dialog can never drift out of sync with it.
+            try
+            {
+                var exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                var extracted = Icon.ExtractAssociatedIcon(exePath);
+                if (extracted != null)
+                {
+                    _cached = extracted;
+                    return _cached;
+                }
+            }
+            catch
+            {
+                // Fall through to the drawn version below — e.g. running from a context
+                // where ExtractAssociatedIcon can't resolve the exe path.
+            }
+
             using var bmp = new Bitmap(32, 32);
             using (var g = Graphics.FromImage(bmp))
             {

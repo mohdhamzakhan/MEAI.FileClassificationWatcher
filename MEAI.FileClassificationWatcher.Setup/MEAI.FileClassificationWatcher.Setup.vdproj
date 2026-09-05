@@ -76,6 +76,14 @@
             "PrerequisitesLocation" = "2:1"
             "Url" = "8:"
             "ComponentsUrl" = "8:"
+                "Items"
+                {
+                    "{EDC2488A-8267-493A-A98E-7D9C3B36CDF3}:.NETFramework,Version=v4.7.2"
+                    {
+                    "Name" = "8:Microsoft .NET Framework 4.7.2 (x86 and x64)"
+                    "ProductCode" = "8:.NETFramework,Version=v4.7.2"
+                    }
+                }
             }
         }
     }
@@ -164,15 +172,15 @@
         {
         "Name" = "8:Microsoft Visual Studio"
         "ProductName" = "8:MEAI File Classification Watcher"
-        "ProductCode" = "8:{FF279CD3-5BBB-47AD-906B-675F5A0C1264}"
-        "PackageCode" = "8:{1F055150-ADC8-4632-BDA5-F3B32F4D00A4}"
+        "ProductCode" = "8:{4898EC6E-EF20-4CF1-A32B-E70AE740F55E}"
+        "PackageCode" = "8:{F1827C17-926A-4979-9C7E-74D9D82C5A17}"
         "UpgradeCode" = "8:{6904C538-1DD4-467B-A5B5-8B22ABBCD15D}"
         "AspNetVersion" = "8:4.0.30319.0"
         "RestartWWWService" = "11:FALSE"
         "RemovePreviousVersions" = "11:FALSE"
         "DetectNewerInstalledVersion" = "11:TRUE"
         "InstallAllUsers" = "11:FALSE"
-        "ProductVersion" = "8:1.26.001"
+        "ProductVersion" = "8:1.26.002"
         "Manufacturer" = "8:MEAI IT Department"
         "ARPHELPTELEPHONE" = "8:"
         "ARPHELPLINK" = "8:"
@@ -686,7 +694,7 @@
         {
             "{5259A561-127C-4D43-A0A1-72F10C7B3BF8}:_07F941A450114B0D92FDE2335BE9BD7D"
             {
-            "SourcePath" = "8:..\\MEAI.FileClassificationWatcher\\obj\\Debug\\net8.0-windows\\apphost.exe"
+            "SourcePath" = "8:..\\MEAI.FileClassificationWatcher\\obj\\Release\\net8.0-windows\\apphost.exe"
             "TargetName" = "8:"
             "Tag" = "8:"
             "Folder" = "8:_C29494574D954ECBBE3E84DDAD2AC3B2"
