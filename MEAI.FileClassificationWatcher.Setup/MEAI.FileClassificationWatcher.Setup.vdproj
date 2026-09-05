@@ -172,15 +172,15 @@
         {
         "Name" = "8:Microsoft Visual Studio"
         "ProductName" = "8:MEAI File Classification Watcher"
-        "ProductCode" = "8:{4898EC6E-EF20-4CF1-A32B-E70AE740F55E}"
-        "PackageCode" = "8:{F1827C17-926A-4979-9C7E-74D9D82C5A17}"
+        "ProductCode" = "8:{B7E08D36-EF6F-444B-97A0-0DE5EA5D0A66}"
+        "PackageCode" = "8:{08315B27-E3B0-4317-9751-32F4703DB023}"
         "UpgradeCode" = "8:{6904C538-1DD4-467B-A5B5-8B22ABBCD15D}"
         "AspNetVersion" = "8:4.0.30319.0"
         "RestartWWWService" = "11:FALSE"
         "RemovePreviousVersions" = "11:FALSE"
         "DetectNewerInstalledVersion" = "11:TRUE"
         "InstallAllUsers" = "11:FALSE"
-        "ProductVersion" = "8:1.26.002"
+        "ProductVersion" = "8:1.26.003"
         "Manufacturer" = "8:MEAI IT Department"
         "ARPHELPTELEPHONE" = "8:"
         "ARPHELPLINK" = "8:"
@@ -694,7 +694,7 @@
         {
             "{5259A561-127C-4D43-A0A1-72F10C7B3BF8}:_07F941A450114B0D92FDE2335BE9BD7D"
             {
-            "SourcePath" = "8:..\\MEAI.FileClassificationWatcher\\obj\\Release\\net8.0-windows\\apphost.exe"
+            "SourcePath" = "8:..\\MEAI.FileClassificationWatcher\\obj\\Debug\\net8.0-windows\\apphost.exe"
             "TargetName" = "8:"
             "Tag" = "8:"
             "Folder" = "8:_C29494574D954ECBBE3E84DDAD2AC3B2"
