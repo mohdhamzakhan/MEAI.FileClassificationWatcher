@@ -37,6 +37,12 @@ namespace MEAI.FileClassificationWatcher
         {
             Text = "Document Classification";
             Icon = BrandIcon.Create();
+            Shown += (_, _) =>
+            {
+                TopMost = true;
+                Activate();
+                ForceForeground.Apply(Handle);
+            };
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterScreen;
             MinimizeBox = false;
