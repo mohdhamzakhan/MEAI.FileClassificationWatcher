@@ -540,75 +540,99 @@ namespace MEAI.FileClassificationWatcher
                     : "Confirm the classification for this updated file.";
 
                 ClassificationLevel? selected = null;
-                var thread = new Thread(() =>
-                {
-                    using var form = new ClassificationPromptForm(
-                        Path.GetFileName(path), headline,
-                        currentLevel, allowCancel: false); // no Cancel option, ever — always mandatory
-                    _activePrompts[path] = form;
-                    if (form.ShowDialog() == DialogResult.OK)
-                        selected = form.SelectedLevel;
-                });
-                thread.SetApartmentState(ApartmentState.STA);
-                thread.Start();
-                thread.Join();
-                _activePrompts.TryRemove(path, out _);
-
-                // allowCancel is now always false — every prompt is mandatory, and
-                // ClassificationPromptForm blocks any force-close that isn't the Confirm
-                // button or a deliberate Supersede() (renamed mid-classification), so
-                // selected should always be set here except in that supersede case. Kept
-                // as a fail-safe rather than an assumption: if a mandatory prompt ever
-                // still comes back null, fall back to the file's existing classification
-                // if it had one, or Confidential for a genuinely new file — either way
-                // avoids silently leaving it unclassified or skipping the write.
-                if (selected == null)
-                {
-                    if (!File.Exists(path))
-                    {
-                        // Superseded by a rename — this path is gone, there's nothing left
-                        // to classify here, and a fresh cycle already started for whatever
-                        // the file is now called. Just stop, don't apply a fallback level
-                        // to a file that no longer exists at this path.
-                        Logger.LogInfo($"HandleOfficeFileClosedAsync: prompt for '{path}' was superseded (file renamed/removed) — skipping.");
-                        return;
-                    }
-                    selected = currentLevel ?? ClassificationLevel.Confidential;
-                    Logger.LogInfo($"HandleOfficeFileClosedAsync: mandatory prompt for '{path}' closed without a selection — defaulting to {selected}.");
-                }
-
-                var newLevel = selected.Value;
-                var levelChanged = newLevel.ToString() != currentFromApi;
-
-                // Tri-state password action — see OfficeDocumentClassifier for the convention.
-                // Only ask the user to type a password when the level is NEWLY entering
-                // Secret/TopSecret; staying at the same Secret/TopSecret level leaves whatever
-                // password is already embedded in the file untouched (we never asked the user
-                // to retype a password they already set moments/days ago).
+                ClassificationLevel? preselect = currentLevel; // updated on each Back so re-showing the picker remembers the last choice, not resets to the original
+                string? passwordAction = null;
                 var knownPassword = PasswordStore.TryGet(documentGuid);
                 bool fileAlreadyPassworded = knownPassword != null;
-                string? passwordAction = null;
-                bool needsSecretLevel = newLevel == ClassificationLevel.Secret || newLevel == ClassificationLevel.TopSecret;
+                ClassificationLevel newLevel;
 
-                if (needsSecretLevel && !fileAlreadyPassworded)
+                // Loops back to the classification picker if Back is pressed on the
+                // password screen — Secret/TopSecret + Confirm used to be a one-way door
+                // with no way to reconsider the level short of quitting the app, since
+                // every dialog is mandatory (no Cancel) by design elsewhere in this flow.
+                // Back is deliberately NOT the same as Cancel: it can only return to the
+                // level picker, never abandon classification entirely.
+                while (true)
                 {
-                    passwordAction = PromptForPassword(path, newLevel, allowCancel: false); // no Cancel, ever
-                    if (passwordAction == null)
+                    selected = null;
+                    var thread = new Thread(() =>
                     {
-                        // Should be unreachable now that the dialog can't be force-closed
-                        // without a valid password, but keep a safe fallback rather than
-                        // silently abandoning the whole classification if it somehow happens.
-                        Logger.LogError($"HandleOfficeFileClosedAsync: mandatory password prompt for '{path}' returned null unexpectedly.",
-                            new Exception("PromptForPassword returned null despite allowCancel: false."));
-                        return;
+                        using var form = new ClassificationPromptForm(
+                            Path.GetFileName(path), headline,
+                            preselect, allowCancel: false); // no Cancel option, ever — always mandatory
+                        _activePrompts[path] = form;
+                        if (form.ShowDialog() == DialogResult.OK)
+                            selected = form.SelectedLevel;
+                    });
+                    thread.SetApartmentState(ApartmentState.STA);
+                    thread.Start();
+                    thread.Join();
+                    _activePrompts.TryRemove(path, out _);
+
+                    // allowCancel is now always false — every prompt is mandatory, and
+                    // ClassificationPromptForm blocks any force-close that isn't the
+                    // Confirm button or a deliberate Supersede() (renamed mid-classification),
+                    // so selected should always be set here except in that supersede case.
+                    // Kept as a fail-safe rather than an assumption: if a mandatory prompt
+                    // ever still comes back null, fall back to the file's existing
+                    // classification if it had one, or Confidential for a genuinely new
+                    // file — either way avoids silently leaving it unclassified or
+                    // skipping the write.
+                    if (selected == null)
+                    {
+                        if (!File.Exists(path))
+                        {
+                            // Superseded by a rename — this path is gone, there's nothing
+                            // left to classify here, and a fresh cycle already started for
+                            // whatever the file is now called. Just stop, don't apply a
+                            // fallback level to a file that no longer exists at this path.
+                            Logger.LogInfo($"HandleOfficeFileClosedAsync: prompt for '{path}' was superseded (file renamed/removed) — skipping.");
+                            return;
+                        }
+                        selected = preselect ?? ClassificationLevel.Confidential;
+                        Logger.LogInfo($"HandleOfficeFileClosedAsync: mandatory prompt for '{path}' closed without a selection — defaulting to {selected}.");
                     }
-                    PasswordStore.Save(documentGuid, passwordAction);
+
+                    newLevel = selected.Value;
+                    preselect = newLevel; // if this loop repeats via Back, remember this pick
+
+                    // Tri-state password action — see OfficeDocumentClassifier for the
+                    // convention. Only ask the user to type a password when the level is
+                    // NEWLY entering Secret/TopSecret; staying at the same Secret/TopSecret
+                    // level leaves whatever password is already embedded in the file
+                    // untouched (we never asked the user to retype a password they already
+                    // set moments/days ago).
+                    bool needsSecretLevel = newLevel == ClassificationLevel.Secret || newLevel == ClassificationLevel.TopSecret;
+
+                    if (needsSecretLevel && !fileAlreadyPassworded)
+                    {
+                        var (pwd, wentBack) = PromptForPassword(path, newLevel, allowCancel: false); // no Cancel, ever — Back instead
+                        if (wentBack)
+                            continue; // re-show the classification picker with this level preselected
+
+                        if (pwd == null)
+                        {
+                            // Should be unreachable now that the dialog can't be
+                            // force-closed without a valid password or Back, but keep a
+                            // safe fallback rather than silently abandoning the whole
+                            // classification if it somehow happens.
+                            Logger.LogError($"HandleOfficeFileClosedAsync: mandatory password prompt for '{path}' returned null unexpectedly.",
+                                new Exception("PromptForPassword returned null despite allowCancel: false."));
+                            return;
+                        }
+                        passwordAction = pwd;
+                        PasswordStore.Save(documentGuid, passwordAction);
+                    }
+                    else if (!needsSecretLevel && fileAlreadyPassworded)
+                    {
+                        passwordAction = string.Empty; // downgrading below Secret — clear it
+                        PasswordStore.Delete(documentGuid);
+                    }
+
+                    break; // level (and password, if needed) both settled — proceed to Apply()
                 }
-                else if (!needsSecretLevel && fileAlreadyPassworded)
-                {
-                    passwordAction = string.Empty; // downgrading below Secret — clear it
-                    PasswordStore.Delete(documentGuid);
-                }
+
+                var levelChanged = newLevel.ToString() != currentFromApi;
 
                 _selfAppliedUtc[path] = DateTime.UtcNow; // mark BEFORE Apply's save can fire its echo
                 var applied = OfficeDocumentClassifier.Apply(path, newLevel, passwordAction, knownPassword);
@@ -647,19 +671,21 @@ namespace MEAI.FileClassificationWatcher
 
         // Returns the password to set (non-empty string), or null if the user cancelled
         // (only possible when allowCancel is true — see caller).
-        private static string? PromptForPassword(string path, ClassificationLevel level, bool allowCancel)
+        private static (string? password, bool wentBack) PromptForPassword(string path, ClassificationLevel level, bool allowCancel)
         {
             string? result = null;
+            bool wentBack = false;
             var thread = new Thread(() =>
             {
                 using var form = new PasswordEntryForm(Path.GetFileName(path), level.ToDisplayName(), allowCancel);
                 if (form.ShowDialog() == DialogResult.OK)
                     result = form.EnteredPassword;
+                wentBack = form.WentBack;
             });
             thread.SetApartmentState(ApartmentState.STA);
             thread.Start();
             thread.Join();
-            return result;
+            return (result, wentBack);
         }
 
         private ClassificationLevel PromptMandatory(string path, string headline)

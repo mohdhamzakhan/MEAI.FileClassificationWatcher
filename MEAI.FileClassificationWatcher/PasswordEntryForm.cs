@@ -14,9 +14,14 @@ namespace MEAI.FileClassificationWatcher
         private readonly TextBox _txtConfirm = new() { UseSystemPasswordChar = true, Width = 220 };
         private readonly Label _lblError = new() { ForeColor = Color.Firebrick, AutoSize = true, Visible = false };
         private readonly Button _btnOk = new() { Text = "Set Password", DialogResult = DialogResult.None, AutoSize = true };
+        private readonly Button _btnBack = new() { Text = "\u2190 Back", AutoSize = true };
         private readonly Button _btnCancel;
 
         public string? EnteredPassword { get; private set; }
+        // Distinct from Cancel: lets someone who picked Secret/TopSecret by mistake return
+        // to the classification picker and choose a different level, without reintroducing
+        // a way to abandon classification entirely (which stays banned everywhere else).
+        public bool WentBack { get; private set; }
 
         public PasswordEntryForm(string documentName, string levelDisplayName, bool allowCancel)
         {
@@ -71,8 +76,17 @@ namespace MEAI.FileClassificationWatcher
             _btnOk.Click += (_, _) => Validate();
             Controls.Add(_btnOk);
 
+            _btnBack.Location = new Point(_btnOk.Right + 10, y);
+            _btnBack.Click += (_, _) =>
+            {
+                WentBack = true;
+                DialogResult = DialogResult.Retry; // reused purely as a "went back" sentinel
+                Close();
+            };
+            Controls.Add(_btnBack);
+
             _btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true };
-            _btnCancel.Location = new Point(_btnOk.Right + 10, y);
+            _btnCancel.Location = new Point(_btnBack.Right + 10, y);
             _btnCancel.Enabled = allowCancel;
             _btnCancel.Visible = allowCancel;
             Controls.Add(_btnCancel);
@@ -82,11 +96,12 @@ namespace MEAI.FileClassificationWatcher
 
             // Same reasoning as ClassificationPromptForm: ControlBox = false removes the X
             // button, but doesn't stop Alt+F4 or a taskbar "Close" from force-closing the
-            // window. When mandatory, block any close that didn't come from Validate()
-            // succeeding, so EnteredPassword can't end up null here either.
+            // window. When mandatory, block any close that isn't Validate() succeeding or
+            // the Back button (DialogResult.Retry) — Back is the one deliberate exception,
+            // since it's a controlled path back to the level picker, not an escape hatch.
             FormClosing += (_, e) =>
             {
-                if (!allowCancel && DialogResult != DialogResult.OK)
+                if (!allowCancel && DialogResult != DialogResult.OK && DialogResult != DialogResult.Retry)
                     e.Cancel = true;
             };
         }
