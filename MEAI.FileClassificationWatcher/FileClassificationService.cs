@@ -63,9 +63,15 @@ namespace MEAI.FileClassificationWatcher
 
         public void Start()
         {
+            //can point at the same share — only watch each real folder once.
+            var watchedRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             foreach (var folder in _config.WatchedFolders)
             {
                 if (!Directory.Exists(folder)) continue;
+
+                var canonicalRoot = PathNormalizer.Canonical(folder).TrimEnd('\\');
+                if (!watchedRoots.Add(canonicalRoot)) continue; // already watching this share
 
                 var watcher = new FileSystemWatcher(folder)
                 {
@@ -73,26 +79,43 @@ namespace MEAI.FileClassificationWatcher
                     NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
                     EnableRaisingEvents = true
                 };
-                watcher.Created += (_, e) => Task.Run(() => OnCreated(e.FullPath));
-                watcher.Changed += (_, e) => OnChanged(e.FullPath);
-                watcher.Deleted += (_, e) => Task.Run(() => OnDeletedAsync(e.FullPath));
+
+                watcher.Created += (_, e) =>
+                {
+                    var path = PathNormalizer.Canonical(e.FullPath);
+                    Task.Run(() => OnCreated(path));
+                };
+
+                watcher.Changed += (_, e) =>
+                    OnChanged(PathNormalizer.Canonical(e.FullPath));
+
+                watcher.Deleted += (_, e) =>
+                {
+                    var path = PathNormalizer.Canonical(e.FullPath);
+                    Task.Run(() => OnDeletedAsync(path));
+                };
+
                 watcher.Renamed += (_, e) =>
                 {
+                    // Both paths must be canonical: the dictionaries below are keyed by the
+                    // canonical form, so a raw I:\ or W:\ path would never match an entry.
+                    var oldPath = PathNormalizer.Canonical(e.OldFullPath);
+                    var newPath = PathNormalizer.Canonical(e.FullPath);
+
                     // Cancel any in-flight watch for the OLD path — it's about to point at a
                     // file that no longer exists (classic Explorer "New file" flow: create,
-                    // then immediately rename while still in the inline-edit box). Without
-                    // this, the stale watch runs to completion and OfficeDocumentClassifier
-                    // fails with "couldn't find <old name>" once the popup/Apply cycle
-                    // catches up to a file that's already been renamed away.
-                    if (_pendingCloseWatches.TryRemove(e.OldFullPath, out var staleCts))
+                    // then immediately rename while still in the inline-edit box).
+                    if (_pendingCloseWatches.TryRemove(oldPath, out var staleCts))
                         staleCts.Cancel();
-                    // If a prompt is already open for the old name (mid-classification when
-                    // the rename landed), force-close it instead of leaving it sitting there
-                    // alongside a fresh prompt that's about to start for the new name.
-                    if (_activePrompts.TryRemove(e.OldFullPath, out var staleForm))
+
+                    // If a prompt is already open for the old name, force-close it instead of
+                    // leaving it alongside a fresh prompt for the new name.
+                    if (_activePrompts.TryRemove(oldPath, out var staleForm))
                         staleForm.Supersede(); // safe from any thread — marshals internally
-                    OnChanged(e.FullPath);
+
+                    OnChanged(newPath);
                 };
+
                 _watchers.Add(watcher);
             }
         }
