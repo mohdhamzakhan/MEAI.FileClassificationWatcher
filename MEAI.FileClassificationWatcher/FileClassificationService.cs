@@ -63,16 +63,11 @@ namespace MEAI.FileClassificationWatcher
 
         public void Start()
         {
-            //can point at the same share — only watch each real folder once.
-            var watchedRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var folder in _config.WatchedFolders)
+            // Watch only the outermost folders. If J:\ (whole share) and P:\ (a subfolder of
+            // that same share) are both configured, only J:\ is watched — its watcher with
+            // IncludeSubdirectories = true already covers everything under P:\.
+            foreach (var folder in DistinctRoots(_config.WatchedFolders))
             {
-                if (!Directory.Exists(folder)) continue;
-
-                var canonicalRoot = PathNormalizer.Canonical(folder).TrimEnd('\\');
-                if (!watchedRoots.Add(canonicalRoot)) continue; // already watching this share
-
                 var watcher = new FileSystemWatcher(folder)
                 {
                     IncludeSubdirectories = true,
@@ -98,7 +93,7 @@ namespace MEAI.FileClassificationWatcher
                 watcher.Renamed += (_, e) =>
                 {
                     // Both paths must be canonical: the dictionaries below are keyed by the
-                    // canonical form, so a raw I:\ or W:\ path would never match an entry.
+                    // canonical form, so a raw drive-letter path would never match an entry.
                     var oldPath = PathNormalizer.Canonical(e.OldFullPath);
                     var newPath = PathNormalizer.Canonical(e.FullPath);
 
@@ -120,6 +115,27 @@ namespace MEAI.FileClassificationWatcher
             }
         }
 
+        // Keeps only the outermost folders after resolving mapped drives to their UNC paths.
+        private static List<string> DistinctRoots(IEnumerable<string> folders)
+        {
+            var candidates = folders
+                .Where(Directory.Exists)
+                .Select(f => (Original: f, Canonical: PathNormalizer.Canonical(f).TrimEnd('\\')))
+                .OrderBy(x => x.Canonical.Length) // shortest (outermost) first
+                .ToList();
+
+            var kept = new List<(string Original, string Canonical)>();
+            foreach (var c in candidates)
+            {
+                bool covered = kept.Any(k =>
+                    c.Canonical.Equals(k.Canonical, StringComparison.OrdinalIgnoreCase) ||
+                    c.Canonical.StartsWith(k.Canonical + "\\", StringComparison.OrdinalIgnoreCase));
+
+                if (!covered) kept.Add(c);
+            }
+
+            return kept.Select(k => k.Original).ToList();
+        }
         public void Stop()
         {
             foreach (var w in _watchers) w.Dispose();
