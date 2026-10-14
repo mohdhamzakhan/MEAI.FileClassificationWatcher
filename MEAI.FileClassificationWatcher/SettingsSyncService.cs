@@ -18,6 +18,8 @@ namespace MEAI.FileClassificationWatcher
     {
         private const string DefaultApiBaseUrl = "http://10.235.20.49:5295/api";
         private readonly string _apiBaseUrl;
+        private string? _lastFingerprint;
+        private static string Fingerprint(WatcherConfig c) => JsonSerializer.Serialize(c);
 
         private const string Profile = "Global";
         private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
@@ -61,6 +63,7 @@ namespace MEAI.FileClassificationWatcher
             if (config != null)
             {
                 _lastKnownUpdatedAt = updatedAt;
+                _lastFingerprint = Fingerprint(config);
                 SaveCache(config, updatedAt);
                 return config;
             }
@@ -69,6 +72,7 @@ namespace MEAI.FileClassificationWatcher
             if (cached != null)
             {
                 _lastKnownUpdatedAt = cached.Value.UpdatedAt;
+                _lastFingerprint = Fingerprint(cached.Value.Config);
                 return cached.Value.Config;
             }
 
@@ -87,10 +91,13 @@ namespace MEAI.FileClassificationWatcher
                 var (config, updatedAt) = await TryFetchFromApiAsync();
                 if (config == null) continue; // API unreachable this cycle — keep running with current config
 
-                if (_lastKnownUpdatedAt == null || updatedAt > _lastKnownUpdatedAt)
+                var fingerprint = Fingerprint(config);
+                if (_lastKnownUpdatedAt == null || updatedAt > _lastKnownUpdatedAt || fingerprint != _lastFingerprint)
                 {
                     _lastKnownUpdatedAt = updatedAt;
+                    _lastFingerprint = fingerprint;
                     SaveCache(config, updatedAt);
+                    Logger.LogInfo($"SettingsSync: config changed — reconfiguring. WatchedFolders=[{string.Join(", ", config.WatchedFolders)}]");
                     SettingsChanged?.Invoke(config);
                 }
             }
@@ -102,7 +109,11 @@ namespace MEAI.FileClassificationWatcher
             {
                 // FIXED: Now uses _apiBaseUrl instead of the hardcoded ApiBaseUrl constant
                 var response = await _http.GetAsync($"{_apiBaseUrl}/documentclassification/settings?profile={Profile}");
-                if (!response.IsSuccessStatusCode) return (null, default);
+                if (!response.IsSuccessStatusCode)
+                {
+                    Logger.LogInfo($"SettingsSync: API returned {(int)response.StatusCode} from {_apiBaseUrl}");
+                    return (null, default);
+                }
 
                 var body = await response.Content.ReadFromJsonAsync<JsonElement>();
                 var configJson = body.GetProperty("configJson").GetString();
@@ -116,9 +127,10 @@ namespace MEAI.FileClassificationWatcher
                 ExpandEnvironmentPaths(config);
                 return (config, updatedAt);
             }
-            catch
+            catch (Exception ex)
             {
-                return (null, default); // network/API down — caller falls back to cache/defaults
+                Logger.LogError($"SettingsSync: fetch from {_apiBaseUrl} failed", ex);
+                return (null, default);
             }
         }
 
@@ -127,6 +139,8 @@ namespace MEAI.FileClassificationWatcher
             config.WatchedFolders = config.WatchedFolders
                 .Select(Environment.ExpandEnvironmentVariables)
                 .ToList();
+
+            config.MonitoredExtensions = new HashSet<string>(config.MonitoredExtensions, StringComparer.OrdinalIgnoreCase);
         }
 
         private void SaveCache(WatcherConfig config, DateTime updatedAt)
@@ -137,10 +151,8 @@ namespace MEAI.FileClassificationWatcher
                 var payload = new CachedSettings { Config = config, UpdatedAt = updatedAt };
                 File.WriteAllText(_cacheFile, JsonSerializer.Serialize(payload));
             }
-            catch
-            {
-                // best-effort cache; if this fails we just re-fetch from the API next time
-            }
+            catch (Exception ex) { Logger.LogError($"SettingsSync: could not write cache '{_cacheFile}'", ex); }
+
         }
 
         private static CachedSettings? LoadCache()
@@ -150,10 +162,7 @@ namespace MEAI.FileClassificationWatcher
                 if (!File.Exists(_cacheFile)) return null;
                 return JsonSerializer.Deserialize<CachedSettings>(File.ReadAllText(_cacheFile));
             }
-            catch
-            {
-                return null;
-            }
+            catch (Exception ex) { Logger.LogError($"SettingsSync: could not read cache '{_cacheFile}'", ex); return null; }
         }
 
         private struct CachedSettings
