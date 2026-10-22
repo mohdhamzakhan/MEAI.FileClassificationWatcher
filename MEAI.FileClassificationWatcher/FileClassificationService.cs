@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.IO;
 using System.Security.Cryptography;
 using System.Security.Principal;
 
@@ -163,6 +164,22 @@ namespace MEAI.FileClassificationWatcher
                 && File.GetLastWriteTimeUtc(path) == selfWriteTime)
                 return true; // this Changed event is exactly the write we just made
 
+            try
+            {
+                var fi = new FileInfo(path);
+                // AddSeconds(-1) prevents false positives from millisecond rounding differences
+                if (fi.Exists && fi.LastWriteTime < fi.CreationTime.AddSeconds(-1))
+                {
+                    return true;
+                }
+            }
+            catch (IOException)
+            {
+                // If Windows has a hard exclusive lock on the file during the exact millisecond 
+                // of the paste block write, we can't read attributes. Safe to ignore this event.
+                return true;
+            }
+
             // WHITELIST: only act on extensions explicitly opted in.
             var ext = Path.GetExtension(path);
             if (!_config.MonitoredExtensions.Contains(ext)) return true;
@@ -255,7 +272,16 @@ namespace MEAI.FileClassificationWatcher
 
                 // Give the writing app a moment to finish the initial write before we act.
                 await Task.Delay(500);
-                if (!File.Exists(path)) return; // e.g. a temp file that got renamed/deleted already
+                var fileInfo = new FileInfo(path);
+                if (!fileInfo.Exists) return; // e.g. a temp file that got renamed/deleted already
+
+                if (fileInfo.LastWriteTime < fileInfo.CreationTime.AddSeconds(-1))
+                {
+                    // Ignore the Created event. 
+                    // The file will still generate Changed events as it pastes, which will correctly 
+                    // route to QueueCloseWatch() and prompt the user only AFTER the paste is completely finished.
+                    return;
+                }
 
                 if (OfficeDocumentClassifier.IsOfficeFormat(path))
                 {
