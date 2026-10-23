@@ -62,6 +62,16 @@ namespace MEAI.FileClassificationWatcher
             Start();
         }
 
+        private static bool LooksLikeUntouchedCopy(string path)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                return fi.Exists && fi.LastWriteTime < fi.CreationTime.AddSeconds(-1);
+            }
+            catch (IOException) { return false; }
+        }
+
         public void Start()
         {
             // Watch only the outermost folders. If J:\ (whole share) and P:\ (a subfolder of
@@ -449,6 +459,12 @@ namespace MEAI.FileClassificationWatcher
 
                     if (IsFileReleased(path))
                     {
+                        if (LooksLikeUntouchedCopy(path))
+                        {
+                            Logger.LogInfo($"WatchForReleaseAsync: '{path}' looks like an untouched copy — skipping prompt.");
+                            return;
+                        }
+
                         if (OfficeDocumentClassifier.IsOfficeFormat(path))
                             await HandleOfficeFileClosedAsync(path);
                         else
@@ -603,6 +619,30 @@ namespace MEAI.FileClassificationWatcher
                 var headline = isNew
                     ? "This file has no classification yet.\nSelect a classification level:"
                     : "Confirm the classification for this updated file.";
+
+                if (isNew)
+                {
+                    var embedded = EmbeddedClassification.TryRead(path);
+                    if (embedded != null || EmbeddedClassification.IsEncryptedOoxml(path))
+                    {
+                        // Copy/move/rename of a file that was already classified elsewhere.
+                        if (embedded != null)
+                        {
+                            // Register it under this path's GUID so later lookups find it.
+                            await _api.LogAsync(new ClassificationLogEntry
+                            {
+                                Application = "File",
+                                DocumentName = Path.GetFileName(path),
+                                DocumentPath = path,
+                                DocumentGuid = documentGuid,
+                                ActionType = "Copied",
+                                Classification = embedded.Value.ToString()
+                            });
+                        }
+                        Logger.LogInfo($"'{path}' already classified ({embedded?.ToString() ?? "encrypted"}) — copy/move, no prompt.");
+                        return;
+                    }
+                }
 
                 ClassificationLevel? selected = null;
                 ClassificationLevel? preselect = currentLevel; // updated on each Back so re-showing the picker remembers the last choice, not resets to the original
